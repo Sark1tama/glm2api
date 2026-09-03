@@ -1,0 +1,1 @@
+"""OpenAI protocol adapters."""

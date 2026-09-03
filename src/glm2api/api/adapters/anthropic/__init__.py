@@ -1,0 +1,1 @@
+"""Anthropic Messages protocol adapter."""

@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+*.env
+token.txt
+data/*
+!data/.gitkeep
+log/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,37 @@
+services:
+  glm2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: glm2api
+    restart: unless-stopped
+    environment:
+      GLM2API_LOG_DIR: "/data/log"
+    volumes:
+      - ./.env:/app/.env:rw
+      - ./data:/data
+    ports:
+      - "${GLM2API_HOST_PORT:-18080}:8000"
+    expose:
+      - "8000"
+    networks:
+      shared-net:
+        aliases:
+          - glm2api
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  shared-net:
+    name: shared-net
+    external: true

@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Config
+.env
+token.txt
+data/*
+!data/.gitkeep
+
+log
+.playwright-mcp/
+docs/*
+
+main.spec
+tokenizer.json
