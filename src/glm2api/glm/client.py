@@ -182,11 +182,17 @@ class GLMWebClient:
                 + "；请移除这些参数后重试"
             )
         if request.max_tokens is not None:
+            if (
+                isinstance(request.max_tokens, bool)
+                or not isinstance(request.max_tokens, int)
+                or request.max_tokens < 0
+            ):
+                raise ValueError("max_tokens 必须是非负整数")
             # Anthropic requires max_tokens in every Messages request.  The
             # observed web protocol has no equivalent field, so keep the
-            # request compatible but make the missing hard cap explicit.
+            # request compatible and enforce the output budget locally.
             self.logger.warning(
-                "ChatGLM 网页协议未提供 max_tokens 上游字段，当前仅保留兼容值且不会限制生成"
+                "ChatGLM 网页协议未提供 max_tokens 上游字段，当前保留兼容值并由代理本地限制输出"
             )
 
     def _validate_model_content(
@@ -234,6 +240,7 @@ class GLMWebClient:
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
             usage=usage,
+            max_output_tokens=request.max_tokens,
         )
         try:
             for event in self.iter_sse_events(response):
@@ -276,6 +283,7 @@ class GLMWebClient:
             debug_enabled=self.config.debug_dump_all,
             logger=self.logger,
             usage=usage,
+            max_output_tokens=request.max_tokens,
         )
         request.usage = usage
 
@@ -293,6 +301,9 @@ class GLMWebClient:
                             status=status,
                             last_error=event.get("last_error") if isinstance(event.get("last_error"), dict) else None,
                         )
+                        return
+                    if accumulator.output_budget_exhausted:
+                        yield from accumulator.finalize(status="length")
                         return
 
                 yield from accumulator.finalize(status="stop")

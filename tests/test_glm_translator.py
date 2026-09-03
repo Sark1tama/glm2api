@@ -9,6 +9,7 @@ from glm2api.glm.translator import (
     extract_text_content,
     sanitize_tool_call_payload,
 )
+from glm2api.core.output_budget import OutputTokenBudget
 from glm2api.core.usage import TokenUsage, estimate_conservative_prompt_tokens, estimate_conservative_tokens
 from glm2api.api.adapters.openai.chat_completions import (
     internal_to_openai_chat_completions_response,
@@ -177,6 +178,187 @@ def test_accumulator_counts_intervention_text_in_estimated_output_usage():
     usage_payload = json.loads(final_chunks[-2].split("data: ", 1)[1])
 
     assert usage_payload["usage"]["completion_tokens"] > baseline
+
+
+def test_accumulator_applies_conservative_output_token_budget():
+    accumulator = GLMUpstreamEventAccumulator(model="glm-test", max_output_tokens=10)
+    stream_events, _ = accumulator.consume_event(
+        {
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [{"type": "text", "text": "hello world!"}],
+                }
+            ],
+        }
+    )
+    stream_events.extend(accumulator.finalize(status="finish"))
+
+    streamed_text = "".join(event.text for event in stream_events if event.kind == "text_delta")
+    response = accumulator.build_response()
+
+    assert streamed_text == response.message.content
+    assert isinstance(response.message.content, str)
+    assert response.message.content.startswith("hello")
+    assert estimate_conservative_tokens(response.message.content) <= 10
+    assert response.finish_reason == "length"
+    assert response.usage.output_tokens <= 10
+
+
+def test_accumulator_does_not_emit_partial_tool_call_when_budget_is_exhausted():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"Bash"},
+        max_output_tokens=1,
+    )
+    accumulator.consume_event(
+        {
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": {
+                                "id": "call_bash",
+                                "name": "Bash",
+                                "arguments": '{"command":"pwd"}',
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    response = accumulator.build_response()
+
+    assert response.message.tool_calls == ()
+    assert response.finish_reason == "length"
+
+
+def test_accumulator_returns_length_when_budget_expires_before_required_tool_call():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"Bash"},
+        tool_choice=ToolChoice(mode="required"),
+        max_output_tokens=1,
+    )
+    accumulator.consume_event(
+        {
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [{"type": "think", "think": "先分析再调用工具"}],
+                }
+            ],
+        }
+    )
+
+    events = accumulator.finalize(status="length")
+
+    assert accumulator.output_budget_exhausted is True
+    assert not any(event.kind == "tool_call_delta" for event in events)
+    assert next(event for event in events if event.kind == "finish").finish_reason == "length"
+
+
+def test_length_limit_does_not_allow_a_different_forced_tool():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"Bash", "Read"},
+        tool_choice=ToolChoice(mode="function", name="Bash"),
+        max_output_tokens=1,
+    )
+    accumulator.consume_event(
+        {
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": {
+                                "id": "call_read",
+                                "name": "Read",
+                                "arguments": '{"file_path":"README.md"}',
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="其他工具"):
+        accumulator.build_response()
+
+
+def test_zero_output_budget_is_reported_as_length_without_upstream_content():
+    accumulator = GLMUpstreamEventAccumulator(model="glm-test", max_output_tokens=0)
+
+    events = accumulator.finalize(status="length")
+    response = accumulator.build_response()
+
+    assert accumulator.output_budget_exhausted is True
+    assert next(event for event in events if event.kind == "finish").finish_reason == "length"
+    assert response.finish_reason == "length"
+    assert response.usage.output_tokens == 0
+
+
+def test_output_budget_rejects_later_content_after_truncation():
+    budget = OutputTokenBudget(limit=5)
+
+    assert budget.accept_reasoning("中" * 100) == ""
+    assert budget.truncated is True
+    assert budget.accept_text("a") == ""
+    assert budget.output_tokens == 0
+
+
+def test_tool_call_budget_ignores_suppressed_preface_in_stream_and_response():
+    payload = {
+        "status": "finish",
+        "parts": [
+            {
+                "logic_id": "1",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "I will run the requested command. " * 4,
+                    },
+                    {
+                        "type": "tool_calls",
+                        "tool_calls": {
+                            "id": "call_bash",
+                            "name": "Bash",
+                            "arguments": '{"command":"pwd"}',
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    streaming = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"Bash"},
+        max_output_tokens=120,
+    )
+    non_streaming = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"Bash"},
+        max_output_tokens=120,
+    )
+    streaming.consume_event(payload)
+    non_streaming.consume_event(payload)
+
+    events = streaming.finalize(status="finish")
+    response = non_streaming.build_response()
+
+    assert not any(event.kind == "text_delta" for event in events)
+    assert [event.tool_call.name for event in events if event.kind == "tool_call_delta"] == ["Bash"]
+    assert next(event for event in events if event.kind == "finish").finish_reason == "tool_calls"
+    assert response.message.content is None
+    assert [tool_call.name for tool_call in response.message.tool_calls] == ["Bash"]
+    assert response.finish_reason == "tool_calls"
 
 
 def test_convert_messages_to_glm_prompt_injects_xml_tool_prompt_and_history():

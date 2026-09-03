@@ -508,14 +508,22 @@ class GLM2APIServer:
                 result, _ = glm_client.chat_completion(request)
                 if not isinstance(result, TextGenerationResponse):
                     raise TypeError("GLM 客户端返回了非内部文本响应")
-                response = internal_to_openai_responses_response(result, model)
+                response = internal_to_openai_responses_response(
+                    result,
+                    model,
+                    max_output_tokens=request.max_tokens,
+                )
                 self._write_json(HTTPStatus.OK, response)
 
             def _stream_responses(self, request: TextGenerationRequest, model: str) -> None:
                 request.stream = True
                 stream_iter = glm_client.stream_chat_completion(request)
                 usage = request.usage
-                accumulator = OpenAIResponsesStreamAccumulator(model=model, usage=usage)
+                accumulator = OpenAIResponsesStreamAccumulator(
+                    model=model,
+                    usage=usage,
+                    max_output_tokens=request.max_tokens,
+                )
 
                 writer = start_sse_response(self, self._send_common_headers)
 

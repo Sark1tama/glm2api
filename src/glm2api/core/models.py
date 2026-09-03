@@ -115,6 +115,8 @@ class TextGenerationRequest:
     model: str
     messages: tuple[Message, ...]
     stream: bool = False
+    # Canonical output-token budget; protocol adapters map their public field
+    # (max_tokens, max_completion_tokens, or max_output_tokens) here.
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None

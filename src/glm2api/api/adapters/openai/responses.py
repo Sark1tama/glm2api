@@ -310,9 +310,11 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
     if "stream" in payload and not isinstance(payload["stream"], bool):
         raise ValueError("Responses stream 必须是布尔值")
     if max_output_tokens is not None and (
-        isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int)
+        isinstance(max_output_tokens, bool)
+        or not isinstance(max_output_tokens, int)
+        or max_output_tokens < 0
     ):
-        raise ValueError("Responses max_output_tokens 必须是整数")
+        raise ValueError("Responses max_output_tokens 必须是非负整数")
     for field_name, value in (("temperature", temperature), ("top_p", top_p)):
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
             raise ValueError(f"Responses {field_name} 必须是数字")
@@ -338,17 +340,19 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
 def internal_to_openai_responses_response(
     result: TextGenerationResponse,
     model: str,
+    *,
+    max_output_tokens: int | None = None,
 ) -> dict[str, object]:
     """Convert an internal text result to Responses format."""
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     output: list[dict[str, object]] = []
     output_text_parts: list[str] = []
-    status = "completed"
-    incomplete_details = None
     message = result.message
     finish_reason = result.finish_reason
     usage = result.usage
+    status = "incomplete" if finish_reason == "length" else "completed"
+    incomplete_details = {"reason": "max_output_tokens"} if status == "incomplete" else None
 
     # Build output message item
     msg_content: list[dict[str, object]] = []
@@ -373,7 +377,7 @@ def internal_to_openai_responses_response(
         output.append({
             "type": "message",
             "id": f"msg_{uuid.uuid4().hex[:24]}",
-            "status": "completed",
+            "status": status,
             "role": "assistant",
             "content": msg_content,
         })
@@ -389,10 +393,6 @@ def internal_to_openai_responses_response(
             "status": "completed",
         })
 
-    if finish_reason == "length":
-        status = "incomplete"
-        incomplete_details = {"reason": "max_output_tokens"}
-
     return {
         "id": response_id,
         "object": "response",
@@ -401,6 +401,7 @@ def internal_to_openai_responses_response(
         "error": None,
         "incomplete_details": incomplete_details,
         "instructions": None,
+        "max_output_tokens": max_output_tokens,
         "model": model,
         "output": output,
         "output_text": "".join(output_text_parts),
@@ -423,6 +424,7 @@ class OpenAIResponsesStreamAccumulator:
         self,
         model: str,
         usage: TokenUsage | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         self.model = model
         self.response_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -432,6 +434,8 @@ class OpenAIResponsesStreamAccumulator:
         self.content_index = 0
         self.current_type: str | None = None  # "text" or "function_call"
         self.usage = usage or TokenUsage()
+        self.max_output_tokens = max_output_tokens
+        self.finish_reason = "stop"
         self._text_buffer = ""
         self._full_text = ""  # accumulated full text for message done event
         self._current_msg_id: str | None = None
@@ -445,8 +449,9 @@ class OpenAIResponsesStreamAccumulator:
 
     def _base_response(self, status: str = "in_progress") -> dict[str, object]:
         usage: dict[str, object] | None = None
-        if status == "completed":
+        if status in {"completed", "incomplete"}:
             usage = serialize_openai_responses_usage(self.usage, include_output_details=True)
+        incomplete_details = {"reason": "max_output_tokens"} if status == "incomplete" else None
         return {
             "id": self.response_id,
             "object": "response",
@@ -454,9 +459,9 @@ class OpenAIResponsesStreamAccumulator:
             "status": status,
             "completed_at": int(time.time()) if status == "completed" else None,
             "error": None,
-            "incomplete_details": None,
+            "incomplete_details": incomplete_details,
             "instructions": None,
-            "max_output_tokens": None,
+            "max_output_tokens": self.max_output_tokens,
             "model": self.model,
             "output": list(self._completed_output),
             "parallel_tool_calls": True,
@@ -550,6 +555,8 @@ class OpenAIResponsesStreamAccumulator:
                 }))
 
         elif event.kind == "finish":
+            if event.finish_reason == "length":
+                self.finish_reason = "length"
             self._complete_pending_tool_calls(events)
             events.extend(self.finish())
 
@@ -637,7 +644,7 @@ class OpenAIResponsesStreamAccumulator:
         msg_done: dict[str, object] = {
             "type": "message",
             "id": self._current_msg_id,
-            "status": "completed",
+            "status": "incomplete" if self.finish_reason == "length" else "completed",
             "role": "assistant",
             "content": [{"type": "output_text", "text": self._full_text, "annotations": []}] if self._full_text else [],
         }
@@ -687,7 +694,9 @@ class OpenAIResponsesStreamAccumulator:
             }))
         self._pending_tool_calls.clear()
 
-        events.append(self.sse("response.completed", self._base_response("completed")))
+        status = "incomplete" if self.finish_reason == "length" else "completed"
+        terminal_event = "response.incomplete" if status == "incomplete" else "response.completed"
+        events.append(self.sse(terminal_event, self._base_response(status)))
         events.append("data: [DONE]\n\n")
         return events
 

@@ -15,6 +15,7 @@ from glm2api.api.adapters.anthropic.messages import (
     anthropic_messages_to_internal,
     internal_to_anthropic_messages_response,
 )
+from glm2api.api.adapters.openai.chat_completions import openai_chat_completions_to_internal
 from glm2api.glm.auth import GLMAccessTokenManager
 from glm2api.glm.client import ConcurrentRequestQueue, GLMWebClient, QueueLease, UpstreamAPIError
 from glm2api.glm.errors import QueueTimeoutError
@@ -165,6 +166,31 @@ def test_glm_client_warns_when_max_tokens_cannot_reach_web_protocol():
 
     assert warnings
     assert "max_tokens" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("converter", "payload", "field"),
+    [
+        (
+            anthropic_messages_to_internal,
+            {"model": "glm-4", "messages": [{"role": "user", "content": "hi"}], "max_tokens": -1},
+            "Anthropic",
+        ),
+        (
+            openai_chat_completions_to_internal,
+            {"model": "glm-4", "messages": [{"role": "user", "content": "hi"}], "max_tokens": -1},
+            "OpenAI",
+        ),
+        (
+            openai_responses_to_internal,
+            {"model": "glm-4", "input": "hi", "max_output_tokens": -1},
+            "Responses",
+        ),
+    ],
+)
+def test_output_token_limits_reject_negative_values(converter, payload, field):
+    with pytest.raises(ValueError, match=rf"{field} .*非负整数"):
+        converter(payload)
 
 
 def test_glm_client_applies_model_specific_multimodal_capability():
@@ -939,6 +965,26 @@ def test_internal_to_responses_exposes_output_text_and_standard_fields():
     assert response["usage"] == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
 
 
+def test_internal_to_responses_marks_length_output_incomplete():
+    response = internal_to_openai_responses_response(
+        TextGenerationResponse(
+            response_id="chat_1",
+            model="glm-4",
+            created=1,
+            message=Message(role="assistant", content="truncated"),
+            finish_reason="length",
+            usage=TokenUsage.estimated(input_tokens=2, output_tokens=8),
+        ),
+        model="glm-4",
+        max_output_tokens=8,
+    )
+
+    assert response["status"] == "incomplete"
+    assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert response["max_output_tokens"] == 8
+    assert response["output"][0]["status"] == "incomplete"
+
+
 def test_responses_stream_uses_openai_event_envelope():
     accumulator = OpenAIResponsesStreamAccumulator(model="glm-4")
 
@@ -999,6 +1045,37 @@ def test_responses_stream_completes_on_finish_reason_without_done_sentinel():
     assert payloads[-1]["type"] == "response.completed"
     assert payloads[-1]["response"]["usage"]["input_tokens"] == 2
     assert payloads[-1]["response"]["usage"]["output_tokens"] == 3
+    assert events[-1] == "data: [DONE]\n\n"
+
+
+def test_responses_stream_marks_length_as_incomplete():
+    accumulator = OpenAIResponsesStreamAccumulator(model="glm-4", max_output_tokens=8)
+
+    events = accumulator.feed_event(TextStreamEvent(kind="text_delta", text="hi"))
+    events.extend(
+        accumulator.feed_event(
+            TextStreamEvent(
+                kind="finish",
+                finish_reason="length",
+                usage=TokenUsage.estimated(input_tokens=2, output_tokens=8),
+            )
+        )
+    )
+
+    payloads = [
+        json.loads(event.split("data: ", 1)[1])
+        for event in events
+        if event.startswith("event: ")
+    ]
+    terminal = payloads[-1]
+
+    assert terminal["type"] == "response.incomplete"
+    assert terminal["response"]["status"] == "incomplete"
+    assert terminal["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert terminal["response"]["max_output_tokens"] == 8
+    assert terminal["response"]["output"][0]["status"] == "incomplete"
+    output_item_done = next(payload for payload in payloads if payload["type"] == "response.output_item.done")
+    assert output_item_done["item"]["status"] == "incomplete"
     assert events[-1] == "data: [DONE]\n\n"
 
 

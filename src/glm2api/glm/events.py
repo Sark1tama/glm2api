@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from logging import Logger
 
 from ..core.models import Message, TextGenerationResponse, TextStreamEvent, ToolCall, ToolCallDelta, ToolChoice
+from ..core.output_budget import OutputTokenBudget, bound_output
 from ..core.usage import TokenUsage, estimate_conservative_tokens
 from ..infrastructure.logging import debug_dump
 from ..utils.json import safe_json_dumps
@@ -75,7 +76,9 @@ class GLMUpstreamEventAccumulator:
     input_tokens_estimate: int = 0
     usage: TokenUsage | None = None
     tool_choice: ToolChoice | None = None
+    max_output_tokens: int | None = None
     _rejected_tool_names: set[str] = field(default_factory=set)
+    _output_budget: OutputTokenBudget = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
@@ -83,6 +86,12 @@ class GLMUpstreamEventAccumulator:
         if self.input_tokens_estimate:
             initial_usage = initial_usage.with_estimated(input_tokens=self.input_tokens_estimate)
         self.usage = initial_usage
+        self._output_budget = OutputTokenBudget(limit=self.max_output_tokens)
+
+    @property
+    def output_budget_exhausted(self) -> bool:
+        """Whether a streaming caller can stop consuming the GLM response."""
+        return self._output_budget.limit_reached
 
     def consume_event(self, payload: dict[str, object]) -> tuple[list[TextStreamEvent], str | None]:
         """Consume one ChatGLM upstream event into protocol-neutral events."""
@@ -155,11 +164,12 @@ class GLMUpstreamEventAccumulator:
         self.last_full_reasoning = self._cached_full_reasoning
 
         events: list[TextStreamEvent] = []
-        if reasoning_delta:
+        accepted_reasoning_delta = self._output_budget.accept_reasoning(reasoning_delta)
+        if accepted_reasoning_delta:
             events.append(
                 self._stream_event(
                     "reasoning_delta",
-                    reasoning_content=reasoning_delta,
+                    reasoning_content=accepted_reasoning_delta,
                 )
             )
 
@@ -168,17 +178,19 @@ class GLMUpstreamEventAccumulator:
             if self.allowed_tool_names is not None:
                 self._deferred_visible_text += visible_text_delta
             else:
-                role = None
-                if not self.emitted_role:
-                    role = "assistant"
-                    self.emitted_role = True
-                events.append(
-                    self._stream_event(
-                        "text_delta",
-                        role=role,
-                        text=visible_text_delta,
+                accepted_visible_text = self._output_budget.accept_text(visible_text_delta)
+                if accepted_visible_text:
+                    role = None
+                    if not self.emitted_role:
+                        role = "assistant"
+                        self.emitted_role = True
+                    events.append(
+                        self._stream_event(
+                            "text_delta",
+                            role=role,
+                            text=accepted_visible_text,
+                        )
                     )
-                )
         debug_dump(
             self.logger or logging.getLogger("glm2api.null"),
             self.debug_enabled,
@@ -196,7 +208,6 @@ class GLMUpstreamEventAccumulator:
         tail_text, xml_tool_calls = self.tool_parser.flush()
         all_tool_calls, xml_tool_calls = self._collect_tool_calls(
             xml_tool_calls,
-            source_text=self._cached_full_text,
             source_reasoning=self._cached_full_reasoning,
         )
 
@@ -234,7 +245,36 @@ class GLMUpstreamEventAccumulator:
                     + ", ".join(f"`{name}`" for name in unavailable_names)
                     + f"，已阻止。本轮只允许这些工具：{allowed_names}。"
                 )
-        if final_text and not all_tool_calls:
+        # A completed tool call is the response payload.  This accumulator has
+        # always suppressed any accompanying narration, so it must not consume
+        # budget that belongs to the call.
+        accepted_final_text = self._output_budget.accept_text(
+            "" if all_tool_calls else final_text
+        )
+
+        intervention_text = ""
+        if status == "intervene" and last_error and last_error.get("intervene_text"):
+            intervention_text = str(last_error["intervene_text"])
+        accepted_intervention_text = self._output_budget.accept_text(
+            "\n\n" + intervention_text if intervention_text else ""
+        )
+        accepted_tool_calls = self._output_budget.accept_tool_calls(all_tool_calls)
+
+        finish_reason = (
+            "length"
+            if self._output_budget.limit_reached
+            else "tool_calls"
+            if accepted_tool_calls
+            else "stop"
+        )
+        self._validate_tool_choice(
+            all_tool_calls,
+            source_text=self._cached_full_text,
+            source_reasoning=self._cached_full_reasoning,
+            allow_missing=finish_reason == "length",
+        )
+
+        if accepted_final_text and not accepted_tool_calls:
             role = None
             if not self.emitted_role:
                 role = "assistant"
@@ -243,21 +283,19 @@ class GLMUpstreamEventAccumulator:
                 self._stream_event(
                     "text_delta",
                     role=role,
-                    text=final_text,
+                    text=accepted_final_text,
                 )
             )
 
-        intervention_text = ""
-        if status == "intervene" and last_error and last_error.get("intervene_text"):
-            intervention_text = str(last_error["intervene_text"])
+        if accepted_intervention_text:
             events.append(
                 self._stream_event(
                     "text_delta",
-                    text="\n\n" + intervention_text,
+                    text=accepted_intervention_text,
                 )
             )
 
-        if all_tool_calls:
+        if accepted_tool_calls:
             if not self.emitted_role:
                 events.append(
                     self._stream_event(
@@ -266,7 +304,7 @@ class GLMUpstreamEventAccumulator:
                     )
                 )
                 self.emitted_role = True
-            for tool_call in all_tool_calls:
+            for tool_call in accepted_tool_calls:
                 function = tool_call.get("function", {})
                 if not isinstance(function, dict):
                     continue
@@ -287,10 +325,10 @@ class GLMUpstreamEventAccumulator:
                     )
                 )
 
-        finish_reason = "tool_calls" if all_tool_calls else "stop"
         usage = self._build_usage(
-            all_tool_calls,
-            extra_output_text=("\n\n" + intervention_text) if intervention_text else "",
+            list(accepted_tool_calls),
+            output_text=self._output_budget.text,
+            output_reasoning=self._output_budget.reasoning,
         )
         events.append(
             self._stream_event(
@@ -314,13 +352,31 @@ class GLMUpstreamEventAccumulator:
         )
         all_tool_calls, _ = self._collect_tool_calls(
             xml_tool_calls,
-            source_text=full_text,
             source_reasoning=full_reasoning,
         )
 
-        final_content = clean_content.strip()
+        final_content = "" if all_tool_calls else clean_content.strip()
+        bounded = bound_output(
+            self.max_output_tokens,
+            reasoning=full_reasoning,
+            text=final_content,
+            tool_calls=all_tool_calls,
+        )
+        finish_reason = (
+            "length"
+            if bounded.limit_reached
+            else "tool_calls"
+            if bounded.tool_calls
+            else "stop"
+        )
+        self._validate_tool_choice(
+            all_tool_calls,
+            source_text=full_text,
+            source_reasoning=full_reasoning,
+            allow_missing=finish_reason == "length",
+        )
         internal_tool_calls: list[ToolCall] = []
-        for index, item in enumerate(all_tool_calls):
+        for index, item in enumerate(bounded.tool_calls):
             function = item.get("function") if isinstance(item, dict) else None
             if not isinstance(function, dict):
                 continue
@@ -338,26 +394,30 @@ class GLMUpstreamEventAccumulator:
             )
         message = Message(
             role="assistant",
-            content=None if internal_tool_calls or not final_content else final_content,
-            reasoning_content=full_reasoning or None,
+            content=None if internal_tool_calls or not bounded.text else bounded.text,
+            reasoning_content=bounded.reasoning or None,
             tool_calls=tuple(internal_tool_calls),
         )
-        usage = self._build_usage(all_tool_calls)
+        usage = self._build_usage(
+            list(bounded.tool_calls),
+            output_text=bounded.text,
+            output_reasoning=bounded.reasoning,
+        )
         response = TextGenerationResponse(
             response_id=self.conversation_id,
             model=self.model,
             created=self.created,
             message=message,
-            finish_reason="tool_calls" if internal_tool_calls else "stop",
+            finish_reason=finish_reason,
             usage=usage,
         )
         if self.logger:
             self.logger.info(
                 "非流式响应构建完成 model=%s text_len=%s reasoning_len=%s tool_calls=%s",
                 self.model,
-                len(final_content),
-                len(full_reasoning),
-                len(all_tool_calls),
+                len(bounded.text),
+                len(bounded.reasoning),
+                len(bounded.tool_calls),
             )
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM 非流式最终响应", response)
         return response
@@ -366,10 +426,9 @@ class GLMUpstreamEventAccumulator:
         self,
         parsed_tool_calls: list[dict[str, object]],
         *,
-        source_text: str,
         source_reasoning: str,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-        """Normalize parsed calls, merge native calls, and enforce selection."""
+        """Normalize parsed calls and merge native calls."""
         xml_tool_calls = sanitize_tool_calls(
             parsed_tool_calls,
             fallback_url=self.fallback_tool_url,
@@ -383,11 +442,6 @@ class GLMUpstreamEventAccumulator:
             normalized_call["index"] = len(all_tool_calls)
             all_tool_calls.append(normalized_call)
 
-        self._validate_tool_choice(
-            all_tool_calls,
-            source_text=source_text,
-            source_reasoning=source_reasoning,
-        )
         return all_tool_calls, xml_tool_calls
 
     def _validate_tool_choice(
@@ -396,6 +450,7 @@ class GLMUpstreamEventAccumulator:
         *,
         source_text: str,
         source_reasoning: str,
+        allow_missing: bool = False,
     ) -> None:
         choice = self.tool_choice
         if choice is None or choice.mode == "auto":
@@ -421,8 +476,6 @@ class GLMUpstreamEventAccumulator:
                 raise ValueError("tool_choice=none 时模型输出了工具调用")
             return
 
-        if not actual_names:
-            raise ValueError(f"tool_choice={choice.mode} 但模型未输出工具调用")
         if choice.mode == "function":
             unexpected_names = {
                 name
@@ -434,6 +487,10 @@ class GLMUpstreamEventAccumulator:
                     f"tool_choice 指定 {choice.name}，但模型输出了其他工具: "
                     f"{', '.join(sorted(unexpected_names))}"
                 )
+        if not actual_names:
+            if allow_missing and not any(attempted_names):
+                return
+            raise ValueError(f"tool_choice={choice.mode} 但模型未输出工具调用")
 
     def _record_upstream_usage(self, usage: object) -> None:
         self.usage = (self.usage or TokenUsage()).with_upstream(usage)
@@ -442,19 +499,37 @@ class GLMUpstreamEventAccumulator:
         self,
         all_tool_calls: list[dict[str, object]],
         extra_output_text: str = "",
+        *,
+        output_text: str | None = None,
+        output_reasoning: str | None = None,
     ) -> TokenUsage:
         usage = (self.usage or TokenUsage()).with_estimated(
             input_tokens=self.input_tokens_estimate if self.input_tokens_estimate > 0 else None,
-            output_tokens=self._estimate_output_tokens(all_tool_calls, extra_output_text=extra_output_text),
+            output_tokens=self._estimate_output_tokens(
+                all_tool_calls,
+                extra_output_text=extra_output_text,
+                output_text=output_text,
+                output_reasoning=output_reasoning,
+            ),
         )
         self.usage = usage
         return usage
 
-    def _estimate_output_tokens(self, all_tool_calls: list[dict[str, object]], extra_output_text: str = "") -> int:
+    def _estimate_output_tokens(
+        self,
+        all_tool_calls: list[dict[str, object]],
+        extra_output_text: str = "",
+        *,
+        output_text: str | None = None,
+        output_reasoning: str | None = None,
+    ) -> int:
         self._render_full_output()
-        output_parts = [self._cached_full_reasoning, self._cached_full_text]
-        if self._server_side_tool_calls:
-            output_parts.append(safe_json_dumps(self._server_side_tool_calls))
+        output_parts = [
+            self._cached_full_reasoning if output_reasoning is None else output_reasoning,
+            self._cached_full_text if output_text is None else output_text,
+        ]
+        if all_tool_calls:
+            output_parts.append(safe_json_dumps(all_tool_calls))
         if extra_output_text:
             output_parts.append(extra_output_text)
         output_text = "\n".join(part for part in output_parts if part)

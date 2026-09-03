@@ -521,8 +521,10 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
     top_p = payload.get("top_p")
     if "stream" in payload and not isinstance(payload["stream"], bool):
         raise ValueError("Anthropic stream 必须是布尔值")
-    if max_tokens is not None and (isinstance(max_tokens, bool) or not isinstance(max_tokens, int)):
-        raise ValueError("Anthropic max_tokens 必须是整数")
+    if max_tokens is not None and (
+        isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 0
+    ):
+        raise ValueError("Anthropic max_tokens 必须是非负整数")
     for field_name, value in (("temperature", temperature), ("top_p", top_p)):
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
             raise ValueError(f"Anthropic {field_name} 必须是数字")

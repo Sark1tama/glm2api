@@ -146,7 +146,7 @@ curl http://127.0.0.1:8000/v1/videos/video_xxx/content -o result.mp4
 
 聊天图片和文件会先上传到 ChatGLM 网页端。Anthropic `document`、Responses `input_file.file_data/file_url` 可转换；外部 `file_id` 没有本地文件资源映射，会返回 400。
 
-ChatGLM 网页协议没有通用的 `temperature`、`top_p`、`stop`、`response_format` 或输出长度字段；这些参数会明确返回 400。`max_tokens`/`max_output_tokens` 仅保留兼容值并告警，不会限制上游生成。
+ChatGLM 网页协议没有通用的 `temperature`、`top_p`、`stop` 或 `response_format` 字段；这些参数会明确返回 400。Anthropic 的 `max_tokens`、Chat Completions 的 `max_tokens`/`max_completion_tokens` 以及 Responses 的 `max_output_tokens` 会映射到统一的本地输出 token 预算，并使用保守估算限制返回内容；该限制不会减少 GLM 上游已经开始的生成计算。
 
 网页 SSE 当前不提供 token 统计，因此响应中的 `usage` 是基于原始请求和转换后 prompt 的保守估算，不代表计费精度；若上游将来返回统计值，则优先使用上游字段。
 

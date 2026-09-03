@@ -285,8 +285,10 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
         raise ValueError("OpenAI max_tokens 与 max_completion_tokens 不能同时提供")
     if max_tokens is None:
         max_tokens = max_completion_tokens
-    if max_tokens is not None and (isinstance(max_tokens, bool) or not isinstance(max_tokens, int)):
-        raise ValueError("OpenAI max_tokens 必须是整数")
+    if max_tokens is not None and (
+        isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 0
+    ):
+        raise ValueError("OpenAI max_tokens 必须是非负整数")
     temperature = payload.get("temperature")
     top_p = payload.get("top_p")
     for field_name, value in (("temperature", temperature), ("top_p", top_p)):
