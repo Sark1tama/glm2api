@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from email.generator import _make_boundary  # type: ignore
 
-from ..config import DEFAULT_VIDEO_MODEL_NAME
+from ..config import BUILTIN_VIDEO_MODELS, DEFAULT_VIDEO_MODEL_NAME
 from ..glm.errors import UpstreamAPIError
 from ..infrastructure.logging import debug_dump
 
@@ -211,6 +211,9 @@ def normalize_video_request(payload: dict[str, object]) -> NormalizedVideoReques
         raise ValueError(f"prompt 不能超过 {VIDEO_MAX_PROMPT_LENGTH} 个字符。")
 
     model = str(payload.get("model", DEFAULT_VIDEO_MODEL_NAME)).strip() or DEFAULT_VIDEO_MODEL_NAME
+    if model not in BUILTIN_VIDEO_MODELS:
+        supported = ", ".join(BUILTIN_VIDEO_MODELS)
+        raise ValueError(f"当前视频接口不支持模型 {model}；支持的模型：{supported}。")
     seconds = _parse_choice(payload.get("seconds", "5"), {"5", "10"}, "seconds")
     size, ratio_width, ratio_height = _parse_size(payload.get("size", "1280x720"))
 

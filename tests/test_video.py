@@ -55,6 +55,11 @@ def test_text_video_payload_matches_chatglm_web_shape():
     }
 
 
+def test_video_request_rejects_unknown_model():
+    with pytest.raises(ValueError, match="当前视频接口不支持模型 glm-video-1-search"):
+        normalize_video_request({"model": "glm-video-1-search", "prompt": "测试"})
+
+
 def test_image_video_payload_uses_source_list_and_forces_five_seconds_for_two_sources():
     request = normalize_video_request({"prompt": "让画面动起来", "seconds": "10", "size": "720x1280"})
 
@@ -181,7 +186,6 @@ def test_image_request_includes_current_chatglm_selected_model(monkeypatch):
     client = object.__new__(GLMWebClient)
     client.config = SimpleNamespace(
         glm_image_assistant_id="image-assistant",
-        glm_image_model_name="glm-image-1",
         chat_stream_url="https://chatglm.test/stream",
         request_timeout=1,
         debug_dump_all=False,
@@ -290,7 +294,6 @@ def test_video_http_endpoint_accepts_json_and_returns_task():
         cors_allow_origin="*",
         server_api_keys=[],
         debug_dump_all=False,
-        exposed_models=["glm-5.3", "glm-5.3-flash"],
     )
     fake_glm = FakeGLM()
     http_server = server_module.GLM2APIServer(config, fake_glm, FakeLogger())

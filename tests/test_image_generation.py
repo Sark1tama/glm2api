@@ -102,7 +102,7 @@ def test_openai_images_adapter_validates_request_boundary():
         openai_images_to_internal({"prompt": "猫", "n": 0}, default_model="glm-image-1")
     with pytest.raises(ValueError, match="response_format"):
         openai_images_to_internal({"prompt": "猫", "response_format": "binary"}, default_model="glm-image-1")
-    with pytest.raises(ValueError, match="仅支持模型"):
+    with pytest.raises(ValueError, match="不支持模型 glm-5.3"):
         openai_images_to_internal({"model": "glm-5.3", "prompt": "猫"}, default_model="glm-image-1")
 
 
@@ -145,7 +145,7 @@ def test_openai_images_adapter_marks_unrepresentable_upstream_result():
 
 def test_generate_images_propagates_upstream_error_event():
     client = object.__new__(GLMWebClient)
-    client.config = SimpleNamespace(glm_image_model_name="glm-image-1", debug_dump_all=False)
+    client.config = SimpleNamespace(debug_dump_all=False)
     client.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
     client.images = ImageService(client)
     released: list[int] = []
@@ -167,7 +167,7 @@ def test_generate_images_propagates_upstream_error_event():
 
 def test_generate_images_accepts_json_upstream_result():
     client = object.__new__(GLMWebClient)
-    client.config = SimpleNamespace(glm_image_model_name="glm-image-1", debug_dump_all=False)
+    client.config = SimpleNamespace(debug_dump_all=False)
     client.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
     client.images = ImageService(client)
     client.request_queue = SimpleNamespace(

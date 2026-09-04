@@ -15,7 +15,7 @@ from glm2api.api.adapters.openai.chat_completions import (
     internal_to_openai_chat_completions_response,
     serialize_openai_chat_completions_stream_event,
 )
-from glm2api.core.models import Message, ToolCall, ToolChoice, ToolDefinition
+from glm2api.core.models import Message, StructuredOutputConfig, ToolCall, ToolChoice, ToolDefinition
 
 
 def _openai_payload(response):
@@ -105,6 +105,98 @@ def test_accumulator_handles_delta_events_then_finish_snapshot():
     streamed_text = "".join(event.text for event in events if event.kind == "text_delta")
     assert streamed_text == answer
     assert _openai_payload(accumulator.build_response())["choices"][0]["message"]["content"] == answer
+
+
+def test_accumulator_applies_stop_sequence_across_stream_chunks():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        stop_sequences=("END",),
+    )
+    events = []
+
+    for text in ("helloE", "NDignored"):
+        stream_events, _ = accumulator.consume_event(
+            {
+                "status": "init",
+                "parts": [
+                    {
+                        "logic_id": "1",
+                        "content": [{"type": "text", "text": text}],
+                    }
+                ],
+            }
+        )
+        events.extend(stream_events)
+
+    assert accumulator.stop_sequence_matched == "END"
+    events.extend(accumulator.finalize(status="stop"))
+
+    assert "".join(event.text for event in events if event.kind == "text_delta") == "hello"
+    finish = next(event for event in events if event.kind == "finish")
+    assert finish.finish_reason == "stop"
+    assert finish.stop_sequence == "END"
+
+    response = accumulator.build_response()
+    assert response.message.content == "hello"
+    assert response.finish_reason == "stop"
+    assert response.stop_sequence == "END"
+
+
+def test_accumulator_flushes_text_when_stop_sequence_is_not_seen():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        stop_sequences=("END",),
+    )
+    events, _ = accumulator.consume_event(
+        {
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            ],
+        }
+    )
+    events.extend(accumulator.finalize(status="finish"))
+
+    assert "".join(event.text for event in events if event.kind == "text_delta") == "hello"
+    assert next(event for event in events if event.kind == "finish").stop_sequence is None
+
+
+def test_accumulator_does_not_parse_tool_markup_after_stop_sequence():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"Bash"},
+        stop_sequences=("END",),
+    )
+    accumulator.consume_event(
+        {
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "answerEND"
+                                '<|DSML|tool_calls><|DSML|invoke name="Bash">'
+                                '<|DSML|parameter name="command">pwd</|DSML|parameter>'
+                                '</|DSML|invoke></|DSML|tool_calls>'
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    response = accumulator.build_response()
+
+    assert response.message.content == "answer"
+    assert response.message.tool_calls == ()
+    assert response.stop_sequence == "END"
 
 
 def test_accumulator_prefers_usage_reported_by_upstream_when_available():
@@ -391,20 +483,107 @@ def test_convert_messages_to_glm_prompt_injects_xml_tool_prompt_and_history():
     assert "<ml_tool_calls>" not in prompt
     assert "# TOOL USE PROTOCOL" in prompt
     assert "Use the DSML format below exactly." in prompt
-    assert "The server will parse this DSML block back into standard OpenAI tool_calls." in prompt
     assert "<|DSML|parameter name=\"actual_parameter_name\"><![CDATA[value]]></|DSML|parameter>" in prompt
     assert "Each argument must be a <|DSML|parameter name=\"...\"> child of the invoke." in prompt
     assert "Parameter names are case-sensitive and must exactly match the schema." in prompt
     assert "never change it to `filepath`, `file_path`, or `FilePath`." in prompt
     assert "# BLOCKED TOOLS" not in prompt
-    assert "Ignore client tool names that are not listed below" in prompt
-    assert "client-executed tools declared for this turn" in prompt
-    assert "Never substitute a remote sandbox result" in prompt
+    assert "two separate execution environments" in prompt
+    assert "client-side tools that run in the user's environment" in prompt
+    assert "available through DSML even when they do not appear in the provider's native tool list" in prompt
+    assert "Tool choice policy: auto." in prompt
+    assert "If the task requires access to the user's environment" in prompt
+    assert "If the user explicitly requests a listed client-side tool" in prompt
+    assert "Do not substitute one execution environment for another." in prompt
     assert prompt.index("# CONVERSATION") < prompt.index("User: 查天气")
     assert prompt.index("<|DSML|tool_result") < prompt.index("# TOOL SCHEMAS")
     assert prompt.index("# TOOL SCHEMAS") < prompt.index("# TOOL USE PROTOCOL")
     assert prompt.index("# TOOL USE PROTOCOL") < prompt.rindex("Assistant:")
     assert prompt.rstrip().endswith("Assistant:")
+
+
+def test_convert_messages_to_glm_prompt_appends_structured_output_constraint():
+    converted = convert_messages_to_glm_prompt(
+        messages=[Message(role="user", content="Create a title")],
+        tools=[_tool("lookup")],
+        structured_output=StructuredOutputConfig(
+            kind="json_schema",
+            name="session_title",
+            schema={
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
+            },
+            strict=True,
+        ),
+    )
+
+    prompt = converted[0]["content"][0]["text"]
+
+    assert "# OUTPUT FORMAT" in prompt
+    assert '\"required\":[\"title\"]' in prompt
+    assert "valid JSON only" in prompt
+    assert "applies to the final answer after tool results" in prompt
+    assert prompt.index("# OUTPUT FORMAT") < prompt.index("# TOOL USE PROTOCOL")
+    assert prompt.rstrip().endswith("Assistant:")
+
+
+def test_plain_text_output_format_does_not_add_prompt_constraints():
+    converted = convert_messages_to_glm_prompt(
+        messages=[Message(role="user", content="Hello")],
+        tools=[],
+        structured_output=StructuredOutputConfig(kind="text"),
+    )
+
+    assert "# OUTPUT FORMAT" not in converted[0]["content"][0]["text"]
+
+
+def test_convert_messages_to_glm_prompt_recovers_tool_result_name_from_history():
+    converted = convert_messages_to_glm_prompt(
+        messages=[
+            Message(
+                role="assistant",
+                tool_calls=(ToolCall(id="call_1", name="Bash", arguments='{"command":"pwd"}'),),
+            ),
+            Message(role="tool", tool_call_id="call_1", content="/workspace"),
+        ],
+        tools=[_tool("Bash")],
+    )
+
+    prompt = converted[0]["content"][0]["text"]
+
+    assert '<|DSML|tool_result call_id="call_1" name="Bash">' in prompt
+    assert "unknown_tool" not in prompt
+
+
+def test_convert_messages_to_glm_prompt_rejects_conflicting_tool_result_name():
+    messages = [
+        Message(
+            role="assistant",
+            tool_calls=(ToolCall(id="call_1", name="Bash", arguments='{"command":"pwd"}'),),
+        ),
+        Message(role="tool", name="Read", tool_call_id="call_1", content="/workspace"),
+    ]
+
+    with pytest.raises(ValueError, match="工具名称 Read .* Bash 不一致"):
+        convert_messages_to_glm_prompt(messages=messages, tools=[_tool("Bash"), _tool("Read")])
+
+
+def test_convert_messages_to_glm_prompt_preserves_mid_conversation_system_order():
+    converted = convert_messages_to_glm_prompt(
+        messages=[
+            Message(role="system", content="global instruction"),
+            Message(role="user", content="check the repository"),
+            Message(role="system", content="SessionStart hook context"),
+        ],
+        tools=[],
+    )
+
+    prompt = converted[0]["content"][0]["text"]
+
+    assert prompt.index("System: global instruction") < prompt.index("User: check the repository")
+    assert prompt.index("User: check the repository") < prompt.index("System: SessionStart hook context")
+    assert prompt.index("System: SessionStart hook context") < prompt.rindex("Assistant:")
 
 
 def test_convert_messages_to_glm_prompt_rejects_orphan_and_duplicate_tool_results():
@@ -495,7 +674,7 @@ def test_accumulator_streaming_tool_call_emits_assistant_role_before_tool_delta(
     assert '"finish_reason":"tool_calls"' in final_chunks[2]
 
 
-def test_accumulator_streaming_extracts_tool_call_from_reasoning_fallback():
+def test_accumulator_streaming_does_not_execute_tool_call_from_reasoning():
     accumulator = GLMUpstreamEventAccumulator(model="glm-test", allowed_tool_names={"write"})
     events, status = accumulator.consume_event(
         {
@@ -524,12 +703,11 @@ def test_accumulator_streaming_extracts_tool_call_from_reasoning_fallback():
 
     assert chunks
     assert '"reasoning_content"' in chunks[0]
-    assert '"delta":{"role":"assistant"}' in final_chunks[0]
-    assert '"tool_calls"' in final_chunks[1]
-    assert '\\"filePath\\":\\"test.txt\\"' in final_chunks[1]
+    assert not any('"tool_calls"' in chunk for chunk in final_chunks)
+    assert '"finish_reason":"stop"' in final_chunks[0]
 
 
-def test_accumulator_build_response_extracts_tool_call_from_reasoning_fallback():
+def test_accumulator_build_response_does_not_execute_tool_call_from_reasoning():
     accumulator = GLMUpstreamEventAccumulator(model="glm-test", allowed_tool_names={"write"})
     accumulator.consume_event(
         {
@@ -555,10 +733,37 @@ def test_accumulator_build_response_extracts_tool_call_from_reasoning_fallback()
     payload = _openai_payload(response)
     message = payload["choices"][0]["message"]
 
-    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+    assert payload["choices"][0]["finish_reason"] == "stop"
     assert message["content"] is None
-    assert message["tool_calls"][0]["function"]["name"] == "write"
-    assert message["tool_calls"][0]["function"]["arguments"] == '{"filePath":"test.txt","content":""}'
+    assert message["reasoning_content"].startswith("<|DSML|tool_calls>")
+    assert "tool_calls" not in message
+
+
+def test_accumulator_tool_choice_none_ignores_dsml_in_reasoning():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names=set(),
+        tool_choice=ToolChoice(mode="none"),
+    )
+    accumulator.consume_event(
+        {
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "think",
+                            "think": "<|DSML|tool_calls><|DSML|invoke name=\"write\">"
+                            "<|DSML|parameter name=\"filePath\">test.txt</|DSML|parameter>"
+                            "</|DSML|invoke></|DSML|tool_calls>",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert accumulator.build_response().finish_reason == "stop"
 
 
 def test_sanitize_shell_command_argument_from_json_string():
@@ -729,7 +934,7 @@ def test_convert_messages_to_glm_prompt_respects_tool_choice_none_and_specific()
         tool_choice=ToolChoice(mode="function", name="get_weather"),
     )
     specific_prompt = specific_converted[0]["content"][0]["text"]
-    assert "You must call exactly `get_weather` before giving a final answer." in specific_prompt
+    assert "call exactly the client-side tool `get_weather` through DSML" in specific_prompt
 
 
 def test_accumulator_enforces_tool_choice_for_text_and_streaming_results():
@@ -789,10 +994,10 @@ def test_convert_messages_to_glm_prompt_preserves_dynamic_tool_names_and_explici
     assert "Tool: blocked_by_admin" not in prompt
     assert "Server-side native tools" not in prompt
     assert "Tool: mcp__CherryFetch__fetchJson" in prompt
-    assert "provider-managed web or sandbox tools" in prompt
-    assert "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`." in prompt
-    assert "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners." in prompt
-    assert "Never output tool-call display text such as `⚙ tool_name [...]`" in prompt
+    assert "Provider-side tools run inside ChatGLM's remote environment" in prompt
+    assert "A tool name emitted through DSML always refers to the listed client-side tool" in prompt
+    assert "Do not emit undeclared names as DSML tools." in prompt
+    assert "Do not draft or hide a client tool call only in reasoning." in prompt
 
 
 def test_convert_messages_to_glm_prompt_drops_blocked_tool_call_history():

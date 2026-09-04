@@ -12,7 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging import Logger
 from urllib.parse import urlparse
 
-from ..config import AppConfig, DEFAULT_CHAT_MODEL_NAME, DEFAULT_MAX_REQUEST_BODY_BYTES
+from ..config import (
+    BUILTIN_EXPOSED_MODELS,
+    AppConfig,
+    DEFAULT_CHAT_MODEL_NAME,
+    DEFAULT_IMAGE_MODEL_NAME,
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
+)
 from ..infrastructure.logging import debug_dump
 from .errors import (
     anthropic_error_type,
@@ -35,6 +41,7 @@ from .adapters.anthropic.messages import (
     write_anthropic_sse_error,
 )
 from ..glm.client import GLMWebClient
+from ..glm.chat import validate_text_model
 from ..glm.errors import QueueTimeoutError, UpstreamAPIError
 from .adapters.openai.chat_completions import (
     internal_to_openai_chat_completions_response,
@@ -117,7 +124,7 @@ class GLM2APIServer:
                                 "object": "list",
                                 "data": [
                                     {"id": model, "object": "model", "owned_by": "glm2api"}
-                                    for model in config.exposed_models
+                                    for model in BUILTIN_EXPOSED_MODELS
                                 ],
                             },
                         )
@@ -325,7 +332,7 @@ class GLM2APIServer:
                     if path == f"{config.api_prefix}/images/generations":
                         request = openai_images_to_internal(
                             payload,
-                            default_model=config.glm_image_model_name,
+                            default_model=DEFAULT_IMAGE_MODEL_NAME,
                         )
                         logger.info("收到绘图请求 model=%s prompt=%s", request.model, request.prompt)
                         result = glm_client.generate_images(request)
@@ -413,6 +420,7 @@ class GLM2APIServer:
                 model = payload.get("model")
                 if not isinstance(model, str) or not model.strip():
                     raise ValueError("Anthropic count_tokens 请求必须包含 model 字段。")
+                validate_text_model(model)
                 if not isinstance(payload.get("messages"), list):
                     raise ValueError("Anthropic count_tokens 请求必须包含 messages 数组。")
 
@@ -512,6 +520,7 @@ class GLM2APIServer:
                     result,
                     model,
                     max_output_tokens=request.max_tokens,
+                    structured_output=request.structured_output,
                 )
                 self._write_json(HTTPStatus.OK, response)
 
@@ -523,6 +532,7 @@ class GLM2APIServer:
                     model=model,
                     usage=usage,
                     max_output_tokens=request.max_tokens,
+                    structured_output=request.structured_output,
                 )
 
                 writer = start_sse_response(self, self._send_common_headers)

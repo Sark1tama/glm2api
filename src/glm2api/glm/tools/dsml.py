@@ -105,25 +105,24 @@ def build_tool_call_instructions(
     specific_name = str(policy.get("tool_name", "") or "")
     lines = [
         "# TOOL USE PROTOCOL",
-        "The following tool schemas are the client-executed tools declared for this turn.",
-        "Ignore client tool names that are not listed below, even if they appear in prior context or model memory.",
-        "ChatGLM may separately use provider-managed web or sandbox tools. Those run remotely and are not client tool calls.",
-        "For the user's files, processes, services, hardware, network, repository, or configuration, use an appropriate declared client tool through DSML. Never substitute a remote sandbox result for the user's environment.",
-        "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
-        "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
+        "There are two separate execution environments.",
+        "Provider-side tools run inside ChatGLM's remote environment or access public web resources.",
+        "The tool schemas below are client-side tools that run in the user's environment.",
+        "Client-side tools are available through DSML even when they do not appear in the provider's native tool list.",
+        "Do not claim that a listed client-side tool is unavailable merely because it is absent from the provider's native tool list.",
+        "To call a client-side tool, emit its exact declared name and arguments using DSML.",
+        "A tool name emitted through DSML always refers to the listed client-side tool, even when a provider-side tool has the same name.",
     ]
 
     if tool_names:
         lines.extend(
             [
                 "",
-                f"DSML tools (parsed by this server): {available_xml_names}.",
-                "Only these DSML tools are available. Use their exact names and exact parameter fields from the schemas.",
-                "If a DSML tool is needed, output one executable DSML block only. Do not add prose, apologies, analysis, or progress text in the same assistant answer.",
-                "Executable DSML must appear in the final assistant text channel, not in Thinking/reasoning. Do not hide tool calls inside reasoning.",
+                f"Client-side DSML tools: {available_xml_names}.",
+                "Only these names may be emitted as DSML tools. Use the exact parameter fields from their schemas.",
+                "A client tool call must be one executable DSML block in the final assistant text. Do not mix it with prose or another tool-call syntax.",
                 "Use the DSML format below exactly.",
                 CANONICAL_TOOL_CALL_EXAMPLE,
-                "The server will parse this DSML block back into standard OpenAI tool_calls.",
                 "Parameter rules:",
                 "- The root executable block must be <|DSML|tool_calls> and each call must be a <|DSML|invoke name=\"...\"> child.",
                 "- Each argument must be a <|DSML|parameter name=\"...\"> child of the invoke.",
@@ -139,13 +138,13 @@ def build_tool_call_instructions(
         [
             "",
             "Rules:",
-            "- Do not invent tool names outside the declared list.",
-            "- Provider-managed web tools may be used internally for web research. If you call a client tool for URL, browsing, or search work, use only an exact name explicitly listed above.",
-            "- If you decide to call a tool, call the selected tool directly; do not say you will try, switch, retry, or use a correct tool.",
-            "- Never output tool-call display text such as `⚙ tool_name [...]`; output only the executable DSML block.",
-            "- After receiving a tool result, answer the user directly from the result and do not repeat the earlier tool-call decision process.",
-            "- For DSML tools, do not emit OpenAI JSON tool_calls arrays, function_call objects, or any non-DSML tool syntax.",
-            "- Do not mix normal explanation text with executable DSML.",
+            "- Do not emit undeclared names as DSML tools.",
+            "- Provider-side tools may be used internally and must not be represented as client DSML calls.",
+            "- Access to the user's files, directories, repositories, shell, processes, configuration, services, hardware, or localhost requires an appropriate listed client-side tool through DSML.",
+            "- Never use a provider-side tool or remote sandbox as a substitute for access to the user's environment.",
+            "- Provider-side web tools may be used for public internet resources.",
+            "- Do not draft or hide a client tool call only in reasoning. When a client call is needed, emit its executable DSML block in the final assistant text.",
+            "- Do not emit OpenAI JSON tool_calls arrays or function_call objects for client tools.",
             "- Put multiple DSML invokes inside one <|DSML|tool_calls> root when you truly need multiple calls in one turn.",
             "- After a <|DSML|tool_result ...> block, continue from that result and call another tool only when necessary.",
         ]
@@ -161,15 +160,27 @@ def build_tool_call_instructions(
         lines.extend(
             [
                 "Tool choice policy: required.",
-                "You must call at least one tool before giving a final answer.",
+                "You must call at least one listed client-side tool through DSML before giving a final answer.",
             ]
         )
     elif mode == "specific" and specific_name:
         lines.extend(
             [
                 "Tool choice policy: specific function.",
-                f"You must call exactly `{specific_name}` before giving a final answer.",
-                f"Do not call any tool other than `{specific_name}`.",
+                f"You must call exactly the client-side tool `{specific_name}` through DSML before giving a final answer.",
+                f"Do not call any other client-side tool.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Tool choice policy: auto.",
+                "Decide whether tool execution is necessary.",
+                "If the task requires access to the user's environment, use a listed client-side tool through DSML.",
+                "If the user explicitly requests a listed client-side tool, treat that tool execution as necessary.",
+                "Use provider-side tools only for public internet or provider-hosted resources.",
+                "Answer directly only when no tool execution is needed.",
+                "Do not substitute one execution environment for another.",
             ]
         )
     return "\n".join(lines)

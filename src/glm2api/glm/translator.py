@@ -9,6 +9,7 @@ from typing import Sequence
 from ..core.models import (
     ContentBlock,
     Message,
+    StructuredOutputConfig,
     TextGenerationRequest,
     ToolCall,
     ToolChoice,
@@ -125,8 +126,19 @@ def request_to_glm_payload(request: TextGenerationRequest) -> dict[str, object]:
         result["tools"] = [tool_definition_to_glm_payload(tool) for tool in request.tools]
     if request.tool_choice is not None:
         result["tool_choice"] = tool_choice_to_glm_value(request.tool_choice)
-    if request.response_format is not None:
-        result["response_format"] = dict(request.response_format)
+    if request.structured_output is not None:
+        output = request.structured_output
+        result["structured_output"] = {
+            key: value
+            for key, value in {
+                "kind": output.kind,
+                "schema": output.schema,
+                "name": output.name,
+                "description": output.description,
+                "strict": output.strict,
+            }.items()
+            if value is not None
+        }
     if request.reasoning_effort is not None:
         result["reasoning_effort"] = request.reasoning_effort
     if request.web_search:
@@ -306,6 +318,7 @@ def convert_messages_to_glm_prompt(
     tools: Sequence[ToolDefinition] | None,
     blocked_tool_names: set[str] | None = None,
     tool_choice: ToolChoice | None = None,
+    structured_output: StructuredOutputConfig | None = None,
 ) -> list[dict[str, object]]:
     chat_messages = messages_to_glm_payload(messages)
     chat_tools = [tool_definition_to_glm_payload(tool) for tool in (tools or [])]
@@ -319,7 +332,7 @@ def convert_messages_to_glm_prompt(
     tool_choice_policy = parse_tool_choice_policy(tool_choice, available_tool_names)
     processed: list[dict[str, str]] = []
     latest_user_url: str | None = extract_recent_user_url(chat_messages)
-    valid_tool_call_ids: set[str] = set()
+    tool_names_by_call_id: dict[str, str] = {}
     repaired_tool_call_ids: set[str] = set()
     consumed_tool_result_ids: set[str] = set()
     for message in chat_messages:
@@ -350,9 +363,9 @@ def convert_messages_to_glm_prompt(
                 )
                 tool_call_id = str(tool_call.get("id", "")).strip()
                 if tool_call_id and not tool_call_id.startswith("call_repaired_"):
-                    if tool_call_id in valid_tool_call_ids:
+                    if tool_call_id in tool_names_by_call_id:
                         raise ValueError(f"assistant tool_call 的 ID 重复: {tool_call_id}")
-                    valid_tool_call_ids.add(tool_call_id)
+                    tool_names_by_call_id[tool_call_id] = tool_name
                     if bool(tool_call.get("_repaired")):
                         repaired_tool_call_ids.add(tool_call_id)
             assistant_text = extract_text_content(content).strip() if content else ""
@@ -364,7 +377,7 @@ def convert_messages_to_glm_prompt(
             tool_call_id = str(message.get("tool_call_id", "")).strip()
             if not tool_call_id:
                 raise ValueError("tool_result 缺少 tool_call_id")
-            if tool_call_id not in valid_tool_call_ids:
+            if tool_call_id not in tool_names_by_call_id:
                 raise ValueError(f"tool_result 找不到对应的 tool_call: {tool_call_id}")
             if tool_call_id and tool_call_id in repaired_tool_call_ids:
                 # The preceding assistant call was repaired and must not be replayed.
@@ -373,7 +386,14 @@ def convert_messages_to_glm_prompt(
                 raise ValueError(f"tool_result 的 tool_call_id 重复: {tool_call_id}")
             consumed_tool_result_ids.add(tool_call_id)
             role = "user"
-            tool_name = str(message.get("name", "")).strip() or "unknown_tool"
+            history_tool_name = tool_names_by_call_id[tool_call_id]
+            explicit_tool_name = str(message.get("name", "")).strip()
+            if explicit_tool_name and explicit_tool_name != history_tool_name:
+                raise ValueError(
+                    f"tool_result 工具名称 {explicit_tool_name} 与 tool_call "
+                    f"{tool_call_id} 的名称 {history_tool_name} 不一致"
+                )
+            tool_name = explicit_tool_name or history_tool_name
             tool_result_text = extract_text_content(content)
             content = serialize_tool_result_block(
                 tool_call_id=tool_call_id or message.get("tool_call_id", "unknown"),
@@ -408,11 +428,51 @@ def convert_messages_to_glm_prompt(
         )
         transcript_parts.append(f"{title}: {item['content']}".strip())
 
+    output_prompt = structured_output_to_prompt(
+        structured_output,
+        tools_available=bool(filtered_tools and tool_choice_policy.get("mode") != "none"),
+    )
+    if output_prompt:
+        transcript_parts.append(output_prompt)
+
     if tool_prompt:
         transcript_parts.append(tool_prompt)
 
     prompt = "\n\n".join(part for part in transcript_parts if part).strip()
     return [{"role": "user", "content": [{"type": "text", "text": prompt + "\n\nAssistant: "}]}]
+
+
+def structured_output_to_prompt(
+    config: StructuredOutputConfig | None,
+    *,
+    tools_available: bool = False,
+) -> str | None:
+    """Build the best-effort output constraint used by the web chat bridge."""
+    if config is None or config.kind == "text":
+        return None
+
+    lines = [
+        "# OUTPUT FORMAT",
+        "Return the final answer as valid JSON only, with no Markdown fence or surrounding prose.",
+    ]
+    if tools_available:
+        lines.append(
+            "If a client-side tool is needed, emit its DSML call first; this JSON constraint "
+            "applies to the final answer after tool results are available."
+        )
+    if config.kind == "json_object":
+        lines.append("The top-level JSON value must be an object.")
+        return "\n".join(lines)
+
+    if config.name:
+        lines.append(f"Schema name: {config.name}")
+    if config.description:
+        lines.append(f"Schema description: {config.description}")
+    lines.append("The JSON value must conform to this schema:")
+    lines.append(safe_json_dumps(config.schema or {}))
+    if config.strict:
+        lines.append("Match the schema exactly and do not add properties that it disallows.")
+    return "\n".join(lines)
 
 __all__ = [
     "convert_messages_to_glm_prompt",
@@ -426,6 +486,7 @@ __all__ = [
     "request_to_glm_payload",
     "sanitize_tool_call_payload",
     "sanitize_tool_calls",
+    "structured_output_to_prompt",
     "tool_call_to_glm_payload",
     "tool_choice_to_glm_value",
     "tool_definition_to_glm_payload",

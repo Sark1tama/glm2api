@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from ..config import DEFAULT_CHAT_MODEL_NAME
+from ..config import BUILTIN_IMAGE_MODELS, DEFAULT_CHAT_MODEL_NAME
 from ..glm.errors import UpstreamAPIError
 from ..glm.events import effective_event_status, is_nonzero_status
 from ..infrastructure.logging import debug_dump
@@ -148,8 +148,9 @@ def openai_images_to_internal(
 
     raw_model = payload.get("model")
     model = str(raw_model or default_model).strip() or default_model
-    if model != default_model:
-        raise ValueError(f"当前图片接口仅支持模型 {default_model}。")
+    if model not in BUILTIN_IMAGE_MODELS:
+        supported = ", ".join(BUILTIN_IMAGE_MODELS)
+        raise ValueError(f"当前图片接口不支持模型 {model}；支持的模型：{supported}。")
 
     raw_n = payload.get("n", 1)
     if isinstance(raw_n, bool) or not isinstance(raw_n, int):
@@ -416,7 +417,7 @@ class ImageService:
         request: ImageGenerationRequest,
     ) -> ImageGenerationResult:
         client = self.client
-        lease = client.request_queue.acquire(f"image:{request.model or client.config.glm_image_model_name}")
+        lease = client.request_queue.acquire(f"image:{request.model}")
         try:
             response, assistant_id = self._open_stream(
                 request,
@@ -458,7 +459,7 @@ class ImageService:
         if not prompt:
             raise UpstreamAPIError(status_code=400, message="图片生成请求缺少 prompt")
 
-        user_model = request.model.strip() or client.config.glm_image_model_name
+        user_model = request.model.strip()
         request_body = json.dumps(
             build_glm_image_payload(
                 request,

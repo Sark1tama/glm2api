@@ -99,7 +99,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-流式请求只需增加 `"stream":true`。OpenAI Responses 和 Anthropic Messages 使用各自原生 JSON/SSE 格式：
+流式请求只需增加 `"stream":true`。OpenAI Responses 和 Anthropic Messages 使用各自原生 JSON/SSE 格式；Responses 会把 GLM 推理作为独立的 `reasoning` output item 返回：
 
 ```python
 from openai import OpenAI
@@ -146,13 +146,15 @@ curl http://127.0.0.1:8000/v1/videos/video_xxx/content -o result.mp4
 
 聊天图片和文件会先上传到 ChatGLM 网页端。Anthropic `document`、Responses `input_file.file_data/file_url` 可转换；外部 `file_id` 没有本地文件资源映射，会返回 400。
 
-ChatGLM 网页协议没有通用的 `temperature`、`top_p`、`stop` 或 `response_format` 字段；这些参数会明确返回 400。Anthropic 的 `max_tokens`、Chat Completions 的 `max_tokens`/`max_completion_tokens` 以及 Responses 的 `max_output_tokens` 会映射到统一的本地输出 token 预算，并使用保守估算限制返回内容；该限制不会减少 GLM 上游已经开始的生成计算。
+Anthropic Messages 的 `messages[].role` 支持 `user`、`assistant` 和 `system`。中途 `system` 消息会按原始位置转换，当前支持字符串或 `text` blocks；Anthropic 工具结果应放在 `user` 消息的 `tool_result` block 中，而不是使用 `role: "tool"`。消息级 `clear_at`、`output_config` 以及 `tool_addition`/`tool_removal` 尚无等价的 GLM 映射，会明确返回 400。
+
+ChatGLM 网页协议没有通用的 `temperature`、`top_p`、停止序列或结构化输出字段；合法的 `temperature` 和 `top_p` 会被接受但忽略，并记录警告。OpenAI Chat Completions 的 `stop` 和 Anthropic Messages 的 `stop_sequences` 由代理在本地流式匹配，命中内容及其后续输出不会返回。Chat Completions 的 `response_format`、Responses 的 `text.format` 和 Anthropic 的 `output_config.format` 会转换为统一的内部结构化输出约束，并通过后置提示尽力要求 GLM 返回 JSON；由于上游没有原生 JSON Schema 解码器，`strict: true` 不代表可达到原厂级严格保证。Anthropic 的 `thinking.type="adaptive"` 与顶层 `output_config.effort` 会映射为 GLM 思考模式；未指定 effort 的 adaptive thinking 按 Anthropic 默认值 `high` 处理，GLM 推理会以 Anthropic `thinking` block 返回，其 `signature` 是仅用于本代理多轮往返的兼容标识，不是 Anthropic 原厂签名。Anthropic 的 `max_tokens`、Chat Completions 的 `max_tokens`/`max_completion_tokens` 以及 Responses 的 `max_output_tokens` 会映射到统一的本地输出 token 预算，并使用保守估算限制返回内容；这些本地限制不会减少 GLM 在代理检测生效前已经生成的少量内容。
 
 网页 SSE 当前不提供 token 统计，因此响应中的 `usage` 是基于原始请求和转换后 prompt 的保守估算，不代表计费精度；若上游将来返回统计值，则优先使用上游字段。
 
 ## 工具调用
 
-公共协议中的工具定义先进入内部工具对象，再由 GLM 文本桥接层构造成网页端可识别的 DSML。上游返回的 DSML、旧 XML 变体和流式片段会被解析回标准工具调用。工具名称、参数名和 `tool_choice` 会在转换前校验；网页端内置的浏览器工具不会自动暴露给客户端。
+公共协议中的工具定义先进入内部工具对象，再由 GLM 文本桥接层构造成网页端可识别的 DSML。只有正文中的 DSML 会被解析回标准工具调用，隐藏推理中的示例或草稿不会执行。工具名称、参数名和 `tool_choice` 会在转换前校验；网页端内置的浏览器工具不会自动暴露给客户端。
 
 ## 项目结构
 

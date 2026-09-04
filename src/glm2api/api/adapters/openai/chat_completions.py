@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from ....core.models import (
     ContentBlock,
     Message,
+    StructuredOutputConfig,
     TextGenerationRequest,
     TextGenerationResponse,
     TextStreamEvent,
@@ -20,6 +21,43 @@ from .common import file_data_to_data_url, tool_choice_from_openai
 
 
 _OPENAI_MESSAGE_ROLES = frozenset({"system", "user", "assistant", "tool", "developer"})
+
+
+def _response_format_from_openai(value: object) -> StructuredOutputConfig | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("OpenAI response_format 必须是对象")
+    format_type = value.get("type")
+    if format_type == "text":
+        return StructuredOutputConfig(kind="text")
+    if format_type == "json_object":
+        return StructuredOutputConfig(kind="json_object")
+    if format_type != "json_schema":
+        raise ValueError("OpenAI response_format.type 必须是 text、json_object 或 json_schema")
+
+    config = value.get("json_schema")
+    if not isinstance(config, dict):
+        raise ValueError("OpenAI response_format.json_schema 必须是对象")
+    name = config.get("name")
+    schema = config.get("schema")
+    description = config.get("description")
+    strict = config.get("strict")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("OpenAI response_format.json_schema.name 必须是非空字符串")
+    if not isinstance(schema, dict):
+        raise ValueError("OpenAI response_format.json_schema.schema 必须是对象")
+    if description is not None and not isinstance(description, str):
+        raise ValueError("OpenAI response_format.json_schema.description 必须是字符串")
+    if strict is not None and not isinstance(strict, bool):
+        raise ValueError("OpenAI response_format.json_schema.strict 必须是布尔值")
+    return StructuredOutputConfig(
+        kind="json_schema",
+        schema=dict(schema),
+        name=name.strip(),
+        description=description,
+        strict=strict,
+    )
 
 
 def _content_block_from_openai(value: object, path: str = "content") -> ContentBlock:
@@ -269,12 +307,14 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
         raise ValueError("OpenAI stop 必须是字符串、字符串数组或 null")
     if isinstance(raw_stop, list) and any(not isinstance(item, str) for item in raw_stop):
         raise ValueError("OpenAI stop 数组元素必须是字符串")
+    if isinstance(raw_stop, list) and len(raw_stop) > 4:
+        raise ValueError("OpenAI stop 最多支持 4 个停止序列")
+    if raw_stop == "" or (
+        isinstance(raw_stop, list) and any(item == "" for item in raw_stop)
+    ):
+        raise ValueError("OpenAI stop 停止序列不能为空")
 
-    response_format = payload.get("response_format")
-    if response_format is not None and not isinstance(response_format, dict):
-        raise ValueError("OpenAI response_format 必须是对象")
-    if response_format is None:
-        response_format = None
+    structured_output = _response_format_from_openai(payload.get("response_format"))
 
     for field_name in ("stream", "web_search", "deep_research"):
         if field_name in payload and not isinstance(payload[field_name], bool):
@@ -325,7 +365,7 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
         stop=stop,
         tools=tools,
         tool_choice=tool_choice_from_openai(payload.get("tool_choice")),
-        response_format=dict(response_format) if response_format is not None else None,
+        structured_output=structured_output,
         reasoning_effort=reasoning_effort,
         web_search=bool(payload.get("web_search", False)),
         deep_research=bool(payload.get("deep_research", False)),

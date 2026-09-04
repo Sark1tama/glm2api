@@ -20,9 +20,11 @@ from glm2api.glm.auth import GLMAccessTokenManager
 from glm2api.glm.client import ConcurrentRequestQueue, GLMWebClient, QueueLease, UpstreamAPIError
 from glm2api.glm.errors import QueueTimeoutError
 from glm2api.glm.events import GLMUpstreamEventAccumulator
+from glm2api.glm.translator import convert_messages_to_glm_prompt
 from glm2api.core.models import (
     ContentBlock,
     Message,
+    StructuredOutputConfig,
     TextGenerationRequest,
     TextGenerationResponse,
     TextStreamEvent,
@@ -30,7 +32,7 @@ from glm2api.core.models import (
     ToolChoice,
     ToolDefinition,
 )
-from glm2api.core.usage import TokenUsage
+from glm2api.core.usage import TokenUsage, estimate_conservative_tokens
 
 from glm2api.api.adapters.openai.responses import (
     OpenAIResponsesStreamAccumulator,
@@ -92,6 +94,44 @@ def test_openai_responses_to_internal_preserves_tool_choice():
     assert converted.tool_choice is not None
     assert converted.tool_choice.mode == "function"
     assert converted.tool_choice.name == "get_weather"
+
+
+def test_openai_responses_to_internal_preserves_reasoning_input_item():
+    converted = openai_responses_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [],
+                    "content": [
+                        {"type": "reasoning_text", "text": "先分析上下文"}
+                    ],
+                    "status": "completed",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "上一轮结论"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "继续"}],
+                },
+            ],
+        }
+    )
+
+    assert converted.messages[0] == Message(
+        role="assistant",
+        content=(ContentBlock(kind="thinking", text="先分析上下文"),),
+    )
+    assert converted.messages[1:] == (
+        Message(role="assistant", content="上一轮结论"),
+        Message(role="user", content="继续"),
+    )
 
 
 def test_glm_client_resolves_tool_choice_before_prompt_translation():
@@ -180,6 +220,7 @@ def test_glm_client_rejects_remote_sandbox_that_replaces_client_tool():
     accumulator = GLMUpstreamEventAccumulator(
         model="glm-test",
         allowed_tool_names={"terminal"},
+        tool_choice=ToolChoice(mode="required"),
     )
     accumulator.consume_event(
         {
@@ -217,20 +258,280 @@ def test_glm_client_allows_remote_sandbox_without_client_tools():
     assert GLMWebClient._remote_sandbox_replaced_client_tool(accumulator) is False
 
 
-def test_glm_client_rejects_generation_parameters_without_web_equivalent():
+def test_glm_client_allows_remote_sandbox_with_auto_client_tools():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"terminal"},
+        tool_choice=ToolChoice(mode="auto"),
+    )
+    accumulator.consume_event(
+        {
+            "parts": [
+                {
+                    "meta_data": {
+                        "tool_result_extra": {"tool_call_name": "execute_sandbox_code"}
+                    }
+                }
+            ]
+        }
+    )
+
+    assert GLMWebClient._remote_sandbox_replaced_client_tool(accumulator) is False
+
+
+def test_glm_client_accepts_structured_output_for_prompt_enforcement():
     client = GLMWebClient.__new__(GLMWebClient)
     client.logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
 
-    for field, value in (
-        ("temperature", 0.2),
-        ("top_p", 0.9),
-        ("stop", ("END",)),
-        ("response_format", {"type": "json_object"}),
-    ):
-        request = TextGenerationRequest(model="glm-4", messages=())
-        setattr(request, field, value)
-        with pytest.raises(ValueError, match="不支持生成参数"):
-            client._validate_generation_parameters(request)
+    request = TextGenerationRequest(
+        model="glm-4",
+        messages=(),
+        structured_output=StructuredOutputConfig(kind="json_object"),
+    )
+
+    client._validate_generation_parameters(request)
+
+
+def test_text_protocol_adapters_normalize_structured_output_formats():
+    schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+        "additionalProperties": False,
+    }
+    chat_request = openai_chat_completions_to_internal(
+        {
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "title"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "session_title",
+                    "description": "A concise title",
+                    "schema": schema,
+                    "strict": True,
+                },
+            },
+        }
+    )
+    responses_request = openai_responses_to_internal(
+        {
+            "model": "glm-4",
+            "input": "title",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "session_title",
+                    "description": "A concise title",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+        }
+    )
+    anthropic_request = anthropic_messages_to_internal(
+        {
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "title"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": schema}
+            },
+        }
+    )
+
+    expected = StructuredOutputConfig(
+        kind="json_schema",
+        schema=schema,
+        name="session_title",
+        description="A concise title",
+        strict=True,
+    )
+    assert chat_request.structured_output == expected
+    assert responses_request.structured_output == expected
+    assert anthropic_request.structured_output == StructuredOutputConfig(
+        kind="json_schema",
+        schema=schema,
+    )
+
+
+def test_openai_json_object_formats_are_normalized():
+    chat_request = openai_chat_completions_to_internal(
+        {
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "title"}],
+            "response_format": {"type": "json_object"},
+        }
+    )
+    responses_request = openai_responses_to_internal(
+        {
+            "model": "glm-4",
+            "input": "title",
+            "text": {"format": {"type": "json_object"}},
+        }
+    )
+
+    assert chat_request.structured_output == StructuredOutputConfig(kind="json_object")
+    assert responses_request.structured_output == StructuredOutputConfig(kind="json_object")
+
+
+def test_responses_echoes_structured_output_format_in_stream_and_nonstream_envelopes():
+    output_format = StructuredOutputConfig(
+        kind="json_schema",
+        name="session_title",
+        schema={"type": "object", "properties": {"title": {"type": "string"}}},
+        strict=True,
+    )
+    result = TextGenerationResponse(
+        response_id="chat_1",
+        model="glm-4",
+        created=1,
+        message=Message(role="assistant", content='{"title":"Demo"}'),
+        finish_reason="stop",
+        usage=TokenUsage.estimated(input_tokens=5, output_tokens=4),
+    )
+
+    response = internal_to_openai_responses_response(
+        result,
+        model="glm-4",
+        structured_output=output_format,
+    )
+    stream_response = OpenAIResponsesStreamAccumulator(
+        model="glm-4",
+        structured_output=output_format,
+    )._base_response()
+
+    expected = {
+        "type": "json_schema",
+        "name": "session_title",
+        "schema": output_format.schema,
+        "strict": True,
+    }
+    assert response["text"]["format"] == expected
+    assert stream_response["text"]["format"] == expected
+
+
+@pytest.mark.parametrize(
+    ("converter", "payload", "message"),
+    [
+        (
+            openai_chat_completions_to_internal,
+            {
+                "model": "glm-4",
+                "messages": [{"role": "user", "content": "title"}],
+                "response_format": {"type": "json_schema", "json_schema": {"schema": {}}},
+            },
+            "json_schema.name",
+        ),
+        (
+            openai_responses_to_internal,
+            {
+                "model": "glm-4",
+                "input": "title",
+                "text": {"format": {"type": "json_schema", "name": "title", "schema": []}},
+            },
+            "text.format.schema",
+        ),
+        (
+            anthropic_messages_to_internal,
+            {
+                "model": "glm-4",
+                "messages": [{"role": "user", "content": "title"}],
+                "output_config": {"format": {"type": "json_object"}},
+            },
+            "format.type",
+        ),
+    ],
+)
+def test_structured_output_formats_reject_invalid_native_shapes(converter, payload, message):
+    with pytest.raises(ValueError, match=message):
+        converter(payload)
+
+
+def test_glm_client_accepts_stop_for_local_enforcement():
+    client = GLMWebClient.__new__(GLMWebClient)
+    client.logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
+
+    client._validate_generation_parameters(
+        TextGenerationRequest(model="glm-4", messages=(), stop=("END",))
+    )
+
+
+def test_text_protocol_adapters_preserve_stop_sequences():
+    openai_request = openai_chat_completions_to_internal(
+        {
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["END", "DONE"],
+        }
+    )
+    anthropic_request = anthropic_messages_to_internal(
+        {
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop_sequences": ["END", "DONE"],
+        }
+    )
+
+    assert openai_request.stop == ("END", "DONE")
+    assert anthropic_request.stop == ("END", "DONE")
+
+
+@pytest.mark.parametrize(
+    ("converter", "payload", "message"),
+    [
+        (
+            openai_chat_completions_to_internal,
+            {
+                "model": "glm-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": "",
+            },
+            "OpenAI stop 停止序列不能为空",
+        ),
+        (
+            anthropic_messages_to_internal,
+            {
+                "model": "glm-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop_sequences": [""],
+            },
+            "Anthropic stop_sequences 的元素不能为空",
+        ),
+    ],
+)
+def test_stop_sequences_reject_empty_values(converter, payload, message):
+    with pytest.raises(ValueError, match=message):
+        converter(payload)
+
+
+def test_openai_stop_rejects_more_than_four_sequences():
+    with pytest.raises(ValueError, match="最多支持 4 个"):
+        openai_chat_completions_to_internal(
+            {
+                "model": "glm-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop": ["1", "2", "3", "4", "5"],
+            }
+        )
+
+
+def test_glm_client_warns_when_sampling_parameters_are_ignored():
+    warnings = []
+    client = GLMWebClient.__new__(GLMWebClient)
+    client.logger = SimpleNamespace(
+        warning=lambda message, *args, **kwargs: warnings.append(message % args)
+    )
+
+    client._validate_generation_parameters(
+        TextGenerationRequest(
+            model="glm-4",
+            messages=(),
+            temperature=0.2,
+            top_p=0.9,
+        )
+    )
+
+    assert warnings == ["ChatGLM 网页协议不支持生成参数 temperature, top_p，已忽略"]
 
 
 def test_glm_client_warns_when_max_tokens_cannot_reach_web_protocol():
@@ -340,7 +641,6 @@ def test_glm_client_request_body_maps_supported_generation_switches(monkeypatch)
     client.config = SimpleNamespace(
         blocked_tool_names=[],
         debug_dump_all=False,
-        model_aliases={},
         glm_assistant_id="assistant_1",
         chat_stream_url="https://example.test/stream",
         request_timeout=1,
@@ -475,6 +775,10 @@ def test_anthropic_messages_to_internal_preserves_mixed_tool_result_order():
     assert converted.messages[2].content == "晴"
     assert converted.messages[3].content == "请继续"
 
+    prompt = convert_messages_to_glm_prompt(converted.messages, converted.tools)[0]["content"][0]["text"]
+    assert '<|DSML|tool_result call_id="call_1" name="get_weather">' in prompt
+    assert "unknown_tool" not in prompt
+
 
 def test_anthropic_messages_to_internal_preserves_assistant_text_tool_text_order():
     converted = anthropic_messages_to_internal(
@@ -549,6 +853,85 @@ def test_anthropic_messages_to_internal_accepts_claude_code_style_history():
     assert converted.messages[3].tool_calls[0].name == "Bash"
     assert converted.messages[3].tool_calls[0].arguments == '{"command":"git status --short"}'
     assert converted.messages[4] == Message(role="tool", content="干净", tool_call_id="toolu_1")
+
+
+def test_anthropic_messages_to_internal_preserves_mid_conversation_system_message():
+    converted = anthropic_messages_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role": "user", "content": "检查仓库"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "SessionStart hook additional context",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert converted.messages == (
+        Message(role="system", content="You are Claude Code."),
+        Message(role="user", content="检查仓库"),
+        Message(role="system", content="SessionStart hook additional context"),
+    )
+
+
+@pytest.mark.parametrize("role", ["tool", "developer", "function", ""])
+def test_anthropic_messages_to_internal_rejects_non_protocol_roles(role):
+    with pytest.raises(ValueError, match="user、assistant 或 system"):
+        anthropic_messages_to_internal(
+            {
+                "model": "glm-5.3-flash",
+                "messages": [{"role": role, "content": "invalid"}],
+            }
+        )
+
+
+def test_anthropic_mid_conversation_system_rejects_non_text_blocks():
+    with pytest.raises(ValueError, match="暂不支持 content block 类型: tool_result"):
+        anthropic_messages_to_internal(
+            {
+                "model": "glm-5.3-flash",
+                "messages": [
+                    {"role": "user", "content": "检查仓库"},
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "invalid",
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize("field", ["clear_at", "output_config"])
+def test_anthropic_mid_conversation_system_rejects_unmapped_message_controls(field):
+    message = {"role": "system", "content": "temporary instruction", field: {}}
+    if field == "clear_at":
+        message[field] = "next_user_message"
+
+    with pytest.raises(ValueError, match=field):
+        anthropic_messages_to_internal(
+            {
+                "model": "glm-5.3-flash",
+                "messages": [
+                    {"role": "user", "content": "检查仓库"},
+                    message,
+                ],
+            }
+        )
 
 
 def test_anthropic_messages_to_internal_preserves_image_tool_result_content():
@@ -734,6 +1117,83 @@ def test_anthropic_messages_to_internal_preserves_thinking_and_redacted_blocks()
     )
 
 
+def test_anthropic_adaptive_thinking_uses_output_config_effort():
+    converted = anthropic_messages_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "检查仓库"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+        }
+    )
+
+    assert converted.reasoning_effort == "max"
+
+
+def test_anthropic_adaptive_thinking_defaults_to_high_effort():
+    converted = anthropic_messages_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "检查仓库"}],
+            "thinking": {"type": "adaptive"},
+        }
+    )
+
+    assert converted.reasoning_effort == "high"
+
+
+def test_anthropic_output_effort_maps_without_explicit_thinking():
+    converted = anthropic_messages_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "检查仓库"}],
+            "output_config": {"effort": "medium"},
+        }
+    )
+
+    assert converted.reasoning_effort == "medium"
+
+
+@pytest.mark.parametrize("effort", ["minimal", "adaptive", "", 1])
+def test_anthropic_output_config_rejects_invalid_effort(effort):
+    with pytest.raises(ValueError, match="output_config.effort"):
+        anthropic_messages_to_internal(
+            {
+                "model": "glm-5.3-flash",
+                "messages": [{"role": "user", "content": "检查仓库"}],
+                "output_config": {"effort": effort},
+            }
+        )
+
+
+def test_anthropic_output_config_preserves_json_schema_format():
+    converted = anthropic_messages_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "检查仓库"}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"type": "object"}}
+            },
+        }
+    )
+
+    assert converted.structured_output == StructuredOutputConfig(
+        kind="json_schema",
+        schema={"type": "object"},
+    )
+
+
+def test_anthropic_adaptive_thinking_rejects_omitted_display():
+    with pytest.raises(ValueError, match="display=omitted"):
+        anthropic_messages_to_internal(
+            {
+                "model": "glm-5.3-flash",
+                "messages": [{"role": "user", "content": "检查仓库"}],
+                "thinking": {"type": "adaptive", "display": "omitted"},
+            }
+        )
+
+
 def test_anthropic_messages_to_internal_rejects_empty_redacted_thinking_data():
     with pytest.raises(ValueError, match=r"content\[0\]\.data 不能为空"):
         anthropic_messages_to_internal(
@@ -746,7 +1206,7 @@ def test_anthropic_messages_to_internal_rejects_empty_redacted_thinking_data():
         )
 
 
-def test_internal_to_anthropic_omits_unsigned_reasoning_and_keeps_signed_blocks():
+def test_internal_to_anthropic_prefers_existing_signed_thinking_blocks():
     response = internal_to_anthropic_messages_response(
         TextGenerationResponse(
             response_id="chat_1",
@@ -774,9 +1234,53 @@ def test_internal_to_anthropic_omits_unsigned_reasoning_and_keeps_signed_blocks(
     ]
 
 
-def test_anthropic_stream_does_not_emit_unsigned_thinking_blocks():
+def test_internal_to_anthropic_emits_reasoning_with_compatibility_signature():
+    response = internal_to_anthropic_messages_response(
+        TextGenerationResponse(
+            response_id="chat_1",
+            model="glm-4",
+            created=1,
+            message=Message(
+                role="assistant",
+                content="完成",
+                reasoning_content="内部推理",
+            ),
+            finish_reason="stop",
+            usage=TokenUsage.estimated(input_tokens=2, output_tokens=3),
+        ),
+        model="glm-4",
+    )
+
+    thinking = response["content"][0]
+    assert thinking["type"] == "thinking"
+    assert thinking["thinking"] == "内部推理"
+    assert isinstance(thinking["signature"], str)
+    assert thinking["signature"]
+    assert response["content"][1] == {"type": "text", "text": "完成"}
+
+
+def test_internal_to_anthropic_reports_matched_stop_sequence():
+    response = internal_to_anthropic_messages_response(
+        TextGenerationResponse(
+            response_id="chat_1",
+            model="glm-4",
+            created=1,
+            message=Message(role="assistant", content="完成"),
+            finish_reason="stop",
+            usage=TokenUsage.estimated(input_tokens=2, output_tokens=3),
+            stop_sequence="END",
+        ),
+        model="glm-4",
+    )
+
+    assert response["stop_reason"] == "stop_sequence"
+    assert response["stop_sequence"] == "END"
+
+
+def test_anthropic_stream_emits_thinking_and_compatibility_signature():
     accumulator = AnthropicMessagesStreamAccumulator(model="glm-4")
-    events = accumulator.feed_event(TextStreamEvent(kind="reasoning_delta", reasoning_content="内部推理"))
+    events = accumulator.feed_event(TextStreamEvent(kind="reasoning_delta", reasoning_content="内部"))
+    events.extend(accumulator.feed_event(TextStreamEvent(kind="reasoning_delta", reasoning_content="推理")))
     events.extend(accumulator.feed_event(TextStreamEvent(kind="text_delta", text="完成")))
     events.extend(accumulator.feed_event(TextStreamEvent(kind="done")))
 
@@ -785,16 +1289,52 @@ def test_anthropic_stream_does_not_emit_unsigned_thinking_blocks():
         for event in events
         if event.startswith("event: ")
     ]
-    assert not any(
-        payload.get("content_block", {}).get("type") == "thinking"
+    block_starts = [
+        payload["content_block"]
         for payload in payloads
         if payload["type"] == "content_block_start"
+    ]
+    deltas = [payload["delta"] for payload in payloads if payload["type"] == "content_block_delta"]
+
+    assert block_starts == [
+        {"type": "thinking", "thinking": "", "signature": ""},
+        {"type": "text", "text": ""},
+    ]
+    assert [delta["type"] for delta in deltas] == [
+        "thinking_delta",
+        "thinking_delta",
+        "signature_delta",
+        "text_delta",
+    ]
+    assert "".join(delta["thinking"] for delta in deltas if delta["type"] == "thinking_delta") == "内部推理"
+    signature = next(delta["signature"] for delta in deltas if delta["type"] == "signature_delta")
+    assert isinstance(signature, str)
+    assert signature
+
+
+def test_anthropic_stream_reports_matched_stop_sequence():
+    accumulator = AnthropicMessagesStreamAccumulator(model="glm-4")
+    events = accumulator.feed_event(
+        TextStreamEvent(
+            kind="finish",
+            finish_reason="stop",
+            stop_sequence="END",
+        )
     )
-    assert any(
-        payload.get("content_block", {}).get("type") == "text"
-        for payload in payloads
-        if payload["type"] == "content_block_start"
+    events.extend(accumulator.feed_event(TextStreamEvent(kind="done")))
+
+    payloads = [
+        json.loads(event.split("data: ", 1)[1])
+        for event in events
+        if event.startswith("event: ")
+    ]
+    message_delta = next(
+        payload for payload in payloads if payload["type"] == "message_delta"
     )
+    assert message_delta["delta"] == {
+        "stop_reason": "stop_sequence",
+        "stop_sequence": "END",
+    }
 
 
 def test_anthropic_messages_to_internal_rejects_unsupported_server_tool():
@@ -1043,6 +1583,34 @@ def test_internal_to_responses_exposes_output_text_and_standard_fields():
     assert response["usage"] == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
 
 
+def test_internal_to_responses_exposes_reasoning_item_and_usage_details():
+    response = internal_to_openai_responses_response(
+        TextGenerationResponse(
+            response_id="chat_1",
+            model="glm-4",
+            created=1,
+            message=Message(
+                role="assistant",
+                content="结论",
+                reasoning_content="分析过程",
+            ),
+            finish_reason="stop",
+            usage=TokenUsage.estimated(input_tokens=2, output_tokens=50),
+        ),
+        model="glm-4",
+    )
+
+    assert [item["type"] for item in response["output"]] == ["reasoning", "message"]
+    reasoning = response["output"][0]
+    assert reasoning["status"] == "completed"
+    assert reasoning["summary"] == []
+    assert reasoning["content"] == [{"type": "reasoning_text", "text": "分析过程"}]
+    assert response["output_text"] == "结论"
+    assert response["usage"]["output_tokens_details"] == {
+        "reasoning_tokens": estimate_conservative_tokens("分析过程")
+    }
+
+
 def test_internal_to_responses_marks_length_output_incomplete():
     response = internal_to_openai_responses_response(
         TextGenerationResponse(
@@ -1088,6 +1656,65 @@ def test_responses_stream_uses_openai_event_envelope():
     assert payloads[-1]["response"]["status"] == "completed"
     assert payloads[-1]["response"]["completed_at"] is not None
     assert payloads[-1]["response"]["usage"]["total_tokens"] == 0
+    assert events[-1] == "data: [DONE]\n\n"
+
+
+def test_responses_stream_emits_reasoning_item_before_text():
+    accumulator = OpenAIResponsesStreamAccumulator(model="glm-4")
+
+    events = accumulator.feed_event(
+        TextStreamEvent(kind="reasoning_delta", reasoning_content="分析")
+    )
+    events.extend(accumulator.feed_event(
+        TextStreamEvent(kind="reasoning_delta", reasoning_content="过程")
+    ))
+    events.extend(accumulator.feed_event(
+        TextStreamEvent(kind="text_delta", role="assistant", text="结论")
+    ))
+    events.extend(accumulator.feed_event(
+        TextStreamEvent(
+            kind="finish",
+            finish_reason="stop",
+            usage=TokenUsage.estimated(input_tokens=2, output_tokens=50),
+        )
+    ))
+
+    payloads = [
+        json.loads(event.split("data: ", 1)[1])
+        for event in events
+        if event.startswith("event: ")
+    ]
+    event_types = [payload["type"] for payload in payloads]
+
+    reasoning_added = next(
+        payload for payload in payloads
+        if payload["type"] == "response.output_item.added"
+        and payload["item"]["type"] == "reasoning"
+    )
+    reasoning_done = next(
+        payload for payload in payloads
+        if payload["type"] == "response.output_item.done"
+        and payload["item"]["type"] == "reasoning"
+    )
+    reasoning_deltas = [
+        payload["delta"]
+        for payload in payloads
+        if payload["type"] == "response.reasoning_text.delta"
+    ]
+
+    assert reasoning_added["item"]["status"] == "in_progress"
+    assert reasoning_deltas == ["分析", "过程"]
+    assert reasoning_done["item"]["status"] == "completed"
+    assert reasoning_done["item"]["content"] == [
+        {"type": "reasoning_text", "text": "分析过程"}
+    ]
+    assert "response.reasoning_text.done" in event_types
+    assert event_types.index("response.reasoning_text.done") < event_types.index("response.output_text.delta")
+    terminal = payloads[-1]["response"]
+    assert [item["type"] for item in terminal["output"]] == ["reasoning", "message"]
+    assert terminal["usage"]["output_tokens_details"] == {
+        "reasoning_tokens": estimate_conservative_tokens("分析过程")
+    }
     assert events[-1] == "data: [DONE]\n\n"
 
 
@@ -1264,7 +1891,6 @@ def test_responses_http_stream_sends_keepalive_while_upstream_is_idle(monkeypatc
         cors_allow_origin="*",
         server_api_keys=[],
         debug_dump_all=False,
-        exposed_models=["glm-4"],
     )
     server = server_module.GLM2APIServer(config, FakeGLM(), FakeLogger())
     thread = threading.Thread(target=server.serve_forever, daemon=True)

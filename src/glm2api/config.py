@@ -15,14 +15,30 @@ DEFAULT_GLM_BASE_URL = "https://chatglm.cn/chatglm"
 DEFAULT_MAX_REQUEST_BODY_BYTES = 101 * 1024 * 1024
 GUEST_REFRESH_TOKEN_MARKER = "__glm_guest__"
 DEFAULT_BLOCKED_TOOL_NAMES = ()
-BUILTIN_TEXT_MODELS = (
-    "glm-5.3",
-    "glm-5.3-flash",
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSpec:
+    kind: str
+    multimodal: bool | None = None
+
+
+BUILTIN_MODEL_CATALOG = {
+    "glm-5.3": ModelSpec(kind="text", multimodal=False),
+    DEFAULT_CHAT_MODEL_NAME: ModelSpec(kind="text", multimodal=True),
+    DEFAULT_IMAGE_MODEL_NAME: ModelSpec(kind="image"),
+    DEFAULT_VIDEO_MODEL_NAME: ModelSpec(kind="video"),
+}
+BUILTIN_TEXT_MODELS = tuple(
+    name for name, spec in BUILTIN_MODEL_CATALOG.items() if spec.kind == "text"
 )
-BUILTIN_IMAGE_MODELS = (DEFAULT_IMAGE_MODEL_NAME,)
-BUILTIN_VIDEO_MODELS = (DEFAULT_VIDEO_MODEL_NAME,)
+BUILTIN_IMAGE_MODELS = tuple(
+    name for name, spec in BUILTIN_MODEL_CATALOG.items() if spec.kind == "image"
+)
+BUILTIN_VIDEO_MODELS = tuple(
+    name for name, spec in BUILTIN_MODEL_CATALOG.items() if spec.kind == "video"
+)
 BUILTIN_EXPOSED_MODELS = BUILTIN_TEXT_MODELS + BUILTIN_IMAGE_MODELS + BUILTIN_VIDEO_MODELS
-BUILTIN_MODEL_ALIASES = {name: name for name in BUILTIN_TEXT_MODELS}
 
 
 class ConfigError(ValueError):
@@ -126,7 +142,6 @@ class AppConfig:
     glm_refresh_tokens: list[str]
     glm_assistant_id: str
     glm_image_assistant_id: str
-    glm_image_model_name: str
     glm_user_agent: str
     glm_delete_conversation: bool
     glm_max_concurrency: int
@@ -135,8 +150,6 @@ class AppConfig:
     glm_busy_retry_interval: float
     glm_guest_max_retries: int
     blocked_tool_names: list[str]
-    exposed_models: list[str]
-    model_aliases: dict[str, str]
     server_api_keys: list[str]
     cors_allow_origin: str
 
@@ -230,10 +243,6 @@ def load_config(env_file: str = ".env") -> AppConfig:
         log_level = "DEBUG"
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         log_level = "INFO"
-    image_model_name = DEFAULT_IMAGE_MODEL_NAME
-    exposed_models = list(BUILTIN_EXPOSED_MODELS)
-    model_aliases = dict(BUILTIN_MODEL_ALIASES)
-
     config = AppConfig(
         env_file_path=env_path,
         env_file_created=env_file_created,
@@ -253,7 +262,6 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_refresh_tokens=refresh_tokens,
         glm_assistant_id=values.get("GLM_ASSISTANT_ID", DEFAULT_ASSISTANT_ID).strip(),
         glm_image_assistant_id=values.get("GLM_IMAGE_ASSISTANT_ID", DEFAULT_IMAGE_ASSISTANT_ID).strip(),
-        glm_image_model_name=image_model_name,
         glm_user_agent=values.get(
             "GLM_USER_AGENT",
             (
@@ -268,8 +276,6 @@ def load_config(env_file: str = ".env") -> AppConfig:
         glm_busy_retry_interval=parse_float(values.get("GLM_BUSY_RETRY_INTERVAL_SECONDS"), 2.0),
         glm_guest_max_retries=max(0, parse_int(values.get("GLM_GUEST_MAX_RETRIES"), 3)),
         blocked_tool_names=parse_list(values.get("BLOCKED_TOOL_NAMES"), DEFAULT_BLOCKED_TOOL_NAMES),
-        exposed_models=exposed_models,
-        model_aliases=model_aliases,
         server_api_keys=parse_list(values.get("SERVER_API_KEYS")),
         cors_allow_origin=values.get("CORS_ALLOW_ORIGIN", "*").strip() or "*",
     )
@@ -302,6 +308,6 @@ def load_config(env_file: str = ".env") -> AppConfig:
         config.api_prefix,
         config.request_timeout,
         config.glm_delete_conversation,
-        len(config.exposed_models),
+        len(BUILTIN_EXPOSED_MODELS),
     )
     return config

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from glm2api.core.models import Message, TextGenerationRequest, ToolDefinition
+from glm2api.core.models import Message, TextGenerationRequest, ToolChoice, ToolDefinition
 from glm2api.core.usage import TokenUsage
 from glm2api.glm.client import GLMWebClient, QueueLease
 from glm2api.glm.errors import UpstreamAPIError
@@ -70,11 +70,12 @@ def _client_for_attempts(attempt_events):
     return client, attempts, opened_requests, deleted_conversations, released_tickets, warnings
 
 
-def _request(stream: bool = False):
+def _request(stream: bool = False, tool_choice: ToolChoice | None = None):
     return TextGenerationRequest(
         model="glm-test",
         messages=(Message(role="user", content="检查本机配置"),),
         stream=stream,
+        tool_choice=tool_choice,
         tools=(
             ToolDefinition(
                 name="terminal",
@@ -115,7 +116,7 @@ def test_non_streaming_private_tool_result_is_discarded_and_retried_once():
     client, responses, opened, deleted, released, warnings = _client_for_attempts(
         [[_private_tool_event()], [_successful_tool_event()]]
     )
-    request = _request()
+    request = _request(tool_choice=ToolChoice(mode="required"))
 
     result, conversation_id = client.chat_completion(request)
 
@@ -137,7 +138,7 @@ def test_streaming_retry_does_not_emit_discarded_attempt_events():
     client, responses, opened, deleted, released, _ = _client_for_attempts(
         [[_private_tool_event()], [_successful_tool_event()]]
     )
-    request = _request(stream=True)
+    request = _request(stream=True, tool_choice=ToolChoice(mode="required"))
 
     events = list(client.stream_chat_completion(request))
 
@@ -159,7 +160,7 @@ def test_private_tool_retry_fails_closed_after_second_contamination():
     )
 
     with pytest.raises(UpstreamAPIError, match="结果不属于客户端环境") as raised:
-        client.chat_completion(_request())
+        client.chat_completion(_request(tool_choice=ToolChoice(mode="required")))
 
     assert raised.value.status_code == 502
     assert len(opened) == 2
@@ -213,6 +214,32 @@ def test_provider_web_tool_is_not_treated_as_client_tool_or_contamination():
     assert released == [0]
 
 
+def test_remote_sandbox_is_allowed_for_auto_tool_choice():
+    final_event = {
+        "conversation_id": "calc",
+        "status": "finish",
+        "parts": [
+            {
+                "logic_id": "answer",
+                "content": [{"type": "text", "text": "42"}],
+            }
+        ],
+    }
+    client, responses, opened, deleted, released, warnings = _client_for_attempts(
+        [[_private_tool_event("calc"), final_event]]
+    )
+
+    result, conversation_id = client.chat_completion(_request())
+
+    assert conversation_id == "calc"
+    assert result.message.content == "42"
+    assert len(opened) == 1
+    assert responses[0].closed is True
+    assert deleted == ["calc"]
+    assert released == [0]
+    assert warnings == []
+
+
 def test_remote_sandbox_does_not_retry_when_attempt_also_returns_client_tool():
     client, responses, opened, deleted, released, _ = _client_for_attempts(
         [[_private_tool_event("mixed"), _successful_tool_event()]]
@@ -225,4 +252,62 @@ def test_remote_sandbox_does_not_retry_when_attempt_also_returns_client_tool():
     assert len(opened) == 1
     assert responses[0].closed is True
     assert deleted == ["mixed"]
+    assert released == [0]
+
+
+def test_non_streaming_stop_sequence_ends_upstream_consumption_early():
+    stop_event = {
+        "conversation_id": "stopped",
+        "status": "init",
+        "parts": [
+            {
+                "logic_id": "answer",
+                "content": [{"type": "text", "text": "helloENDignored"}],
+            }
+        ],
+    }
+    upstream_error = {"status": "error", "last_error": {"message": "must not be consumed"}}
+    client, responses, opened, deleted, released, _ = _client_for_attempts(
+        [[stop_event, upstream_error]]
+    )
+    request = _request()
+    request.stop = "END"
+
+    result, _ = client.chat_completion(request)
+
+    assert result.message.content == "hello"
+    assert result.stop_sequence == "END"
+    assert len(opened) == 1
+    assert responses[0].closed is True
+    assert deleted == ["stopped"]
+    assert released == [0]
+
+
+def test_streaming_stop_sequence_ends_upstream_consumption_early():
+    stop_event = {
+        "conversation_id": "stopped",
+        "status": "init",
+        "parts": [
+            {
+                "logic_id": "answer",
+                "content": [{"type": "text", "text": "helloENDignored"}],
+            }
+        ],
+    }
+    upstream_error = {"status": "error", "last_error": {"message": "must not be consumed"}}
+    client, responses, opened, deleted, released, _ = _client_for_attempts(
+        [[stop_event, upstream_error]]
+    )
+    request = _request(stream=True)
+    request.stop = "END"
+
+    events = list(client.stream_chat_completion(request))
+
+    assert "".join(event.text for event in events if event.kind == "text_delta") == "hello"
+    finish = next(event for event in events if event.kind == "finish")
+    assert finish.finish_reason == "stop"
+    assert finish.stop_sequence == "END"
+    assert len(opened) == 1
+    assert responses[0].closed is True
+    assert deleted == ["stopped"]
     assert released == [0]

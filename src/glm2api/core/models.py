@@ -53,6 +53,23 @@ class ToolChoice:
             raise ValueError("function tool choice requires a name")
 
 
+@dataclass(frozen=True, slots=True)
+class StructuredOutputConfig:
+    """Protocol-neutral text output format requested by an API client."""
+
+    kind: str
+    schema: dict[str, object] | None = None
+    name: str | None = None
+    description: str | None = None
+    strict: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"text", "json_object", "json_schema"}:
+            raise ValueError(f"unsupported structured output kind: {self.kind!r}")
+        if self.kind == "json_schema" and self.schema is None:
+            raise ValueError("json_schema output requires a schema")
+
+
 
 MessageContent = str | tuple[ContentBlock, ...] | None
 
@@ -93,6 +110,7 @@ class TextStreamEvent:
     reasoning_content: str = ""
     tool_call: ToolCallDelta | None = None
     finish_reason: str | None = None
+    stop_sequence: str | None = None
     usage: TokenUsage | None = None
 
 
@@ -106,6 +124,7 @@ class TextGenerationResponse:
     message: Message
     finish_reason: str
     usage: TokenUsage
+    stop_sequence: str | None = None
 
 
 @dataclass(slots=True)
@@ -123,7 +142,7 @@ class TextGenerationRequest:
     stop: str | tuple[str, ...] | None = None
     tools: tuple[ToolDefinition, ...] = ()
     tool_choice: ToolChoice | None = None
-    response_format: dict[str, object] | None = None
+    structured_output: StructuredOutputConfig | None = None
     reasoning_effort: str | None = None
     web_search: bool = False
     deep_research: bool = False
@@ -133,6 +152,7 @@ class TextGenerationRequest:
 __all__ = [
     "ContentBlock",
     "Message",
+    "StructuredOutputConfig",
     "TextGenerationRequest",
     "TextGenerationResponse",
     "TextStreamEvent",

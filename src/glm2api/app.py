@@ -4,7 +4,7 @@ import errno
 import signal
 import traceback
 
-from .config import AppConfig, ConfigError, load_config
+from .config import BUILTIN_EXPOSED_MODELS, AppConfig, ConfigError, load_config
 from .infrastructure.logging import get_logger, setup_logging
 from .api.server import GLM2APIServer
 from .glm.client import GLMWebClient
@@ -23,7 +23,7 @@ class Application:
             "初始化应用 并发=%s 账号数=%s 暴露模型=%s",
             config.glm_max_concurrency,
             len(config.glm_refresh_tokens),
-            len(config.exposed_models),
+            len(BUILTIN_EXPOSED_MODELS),
         )
         self.client = GLMWebClient(config=config, logger=get_logger("glm2api.glm"))
         try:
@@ -49,7 +49,7 @@ class Application:
             self.config.api_prefix,
             len(self.config.glm_refresh_tokens),
             self.config.debug_dump_all,
-            ",".join(self.config.exposed_models),
+            ",".join(BUILTIN_EXPOSED_MODELS),
         )
         try:
             self.server.serve_forever()

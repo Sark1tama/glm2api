@@ -21,13 +21,17 @@ from ..core.models import (
     TextGenerationRequest,
     TextGenerationResponse,
     TextStreamEvent,
-    ToolChoice,
     ToolDefinition,
 )
 from ..core.usage import TokenUsage, estimate_conservative_prompt_tokens
 from ..infrastructure.logging import debug_dump
 from .auth import GLMAccessTokenManager, build_sign
-from .chat import get_model_multimodal_capability, resolve_chat_mode, resolve_networking, resolve_upstream_model
+from .chat import (
+    get_model_multimodal_capability,
+    resolve_chat_mode,
+    resolve_networking,
+    validate_text_model,
+)
 from .errors import QueueTimeoutError, UpstreamAPIError
 from .events import GLMUpstreamEventAccumulator, effective_event_status, is_nonzero_status
 from .translator import convert_messages_to_glm_prompt, extract_recent_user_url, messages_to_glm_payload
@@ -167,21 +171,20 @@ class GLMWebClient:
         return filtered_tools or None, tool_names
 
     def _validate_generation_parameters(self, request: TextGenerationRequest) -> None:
-        unsupported: list[str] = []
-        if request.temperature is not None:
-            unsupported.append("temperature")
-        if request.top_p is not None:
-            unsupported.append("top_p")
-        if request.stop not in (None, "", ()):
-            unsupported.append("stop/stop_sequences")
-        if request.response_format is not None:
-            unsupported.append("response_format")
-        if unsupported:
-            raise ValueError(
-                "当前 ChatGLM 网页协议不支持生成参数: "
-                + ", ".join(unsupported)
-                + "；请移除这些参数后重试"
+        ignored = [
+            name
+            for name, value in (
+                ("temperature", request.temperature),
+                ("top_p", request.top_p),
             )
+            if value is not None
+        ]
+        if ignored:
+            self.logger.warning(
+                "ChatGLM 网页协议不支持生成参数 %s，已忽略",
+                ", ".join(ignored),
+            )
+
         if request.max_tokens is not None:
             if (
                 isinstance(request.max_tokens, bool)
@@ -243,6 +246,8 @@ class GLMWebClient:
                             continue
                         self.raise_for_event_error(event, stream=False)
                         _, status = accumulator.consume_event(event)
+                        if accumulator.stop_sequence_matched is not None:
+                            break
                         if status in {"finish", "intervene"}:
                             break
                 finally:
@@ -317,6 +322,9 @@ class GLMWebClient:
                             else:
                                 buffered_events.extend(stream_events)
 
+                            if accumulator.stop_sequence_matched is not None:
+                                completion_status = "stop"
+                                break
                             if status in {"finish", "intervene"}:
                                 completion_status = status
                                 if isinstance(event.get("last_error"), dict):
@@ -390,6 +398,11 @@ class GLMWebClient:
             logger=self.logger,
             usage=usage,
             max_output_tokens=request.max_tokens,
+            stop_sequences=(
+                (request.stop,)
+                if isinstance(request.stop, str)
+                else request.stop or ()
+            ),
         )
 
     @staticmethod
@@ -403,13 +416,9 @@ class GLMWebClient:
                 "Use one of the declared client tools through DSML for this attempt. A client tool call is required."
             ),
         )
-        tool_choice = request.tool_choice
-        if tool_choice is None or tool_choice.mode == "auto":
-            tool_choice = ToolChoice(mode="required")
         return replace(
             request,
             messages=(*request.messages, correction),
-            tool_choice=tool_choice,
             usage=None,
         )
 
@@ -438,8 +447,11 @@ class GLMWebClient:
 
     @staticmethod
     def _remote_sandbox_replaced_client_tool(accumulator: GLMUpstreamEventAccumulator) -> bool:
+        tool_choice = accumulator.tool_choice
         return (
-            bool(accumulator.allowed_tool_names)
+            tool_choice is not None
+            and tool_choice.mode in {"required", "function"}
+            and bool(accumulator.allowed_tool_names)
             and accumulator.remote_sandbox_used
             and not accumulator.has_client_tool_call()
         )
@@ -612,8 +624,9 @@ class GLMWebClient:
         request: TextGenerationRequest,
         preferred_account_index: int | None = None,
     ):
-        requested_model = request.model or DEFAULT_CHAT_MODEL_NAME
-        upstream_model, assistant_id = resolve_upstream_model(requested_model, self.config)
+        requested_model = validate_text_model(request.model or DEFAULT_CHAT_MODEL_NAME)
+        upstream_model = requested_model
+        assistant_id = self.config.glm_assistant_id
         self._validate_model_content(request, requested_model, upstream_model)
         self._validate_generation_parameters(request)
         filtered_tools, _ = self._resolve_tools(request)
@@ -622,6 +635,7 @@ class GLMWebClient:
             tools=filtered_tools,
             blocked_tool_names={name.strip() for name in self.config.blocked_tool_names if name.strip()},
             tool_choice=request.tool_choice,
+            structured_output=request.structured_output,
         )
         debug_dump(self.logger, self.config.debug_dump_all, "内部文本请求", request)
         debug_dump(self.logger, self.config.debug_dump_all, "转换后的 GLM messages", converted_messages)
@@ -638,12 +652,10 @@ class GLMWebClient:
         )
 
         chat_mode = resolve_chat_mode(
-            model=requested_model,
             reasoning_effort=request.reasoning_effort,
             deep_research=request.deep_research,
         )
         is_networking = resolve_networking(
-            model=requested_model,
             web_search=request.web_search,
         )
 

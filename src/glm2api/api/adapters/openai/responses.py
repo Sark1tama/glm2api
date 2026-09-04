@@ -15,6 +15,7 @@ from ....config import DEFAULT_CHAT_MODEL_NAME
 from ....core.models import (
     ContentBlock,
     Message,
+    StructuredOutputConfig,
     TextGenerationRequest,
     TextGenerationResponse,
     TextStreamEvent,
@@ -22,7 +23,7 @@ from ....core.models import (
     ToolChoice,
     ToolDefinition,
 )
-from ....core.usage import TokenUsage
+from ....core.usage import TokenUsage, estimate_conservative_tokens
 from ...sse import CLIENT_DISCONNECTED, SSEWriter
 from .common import file_data_to_data_url, tool_choice_from_openai
 
@@ -60,6 +61,7 @@ def serialize_openai_responses_usage(
     usage: TokenUsage,
     *,
     include_output_details: bool = False,
+    reasoning_tokens: int = 0,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "input_tokens": usage.input_tokens,
@@ -67,11 +69,68 @@ def serialize_openai_responses_usage(
         "total_tokens": usage.total_tokens,
     }
     if include_output_details:
-        result["output_tokens_details"] = {"reasoning_tokens": 0}
+        result["output_tokens_details"] = {
+            "reasoning_tokens": min(usage.output_tokens, max(0, reasoning_tokens))
+        }
     return result
 
 
 _RESPONSES_MESSAGE_ROLES = frozenset({"system", "developer", "user", "assistant"})
+
+
+def _text_format_from_responses(value: object) -> StructuredOutputConfig | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Responses text 必须是对象")
+    format_value = value.get("format")
+    if format_value is None:
+        return None
+    if not isinstance(format_value, dict):
+        raise ValueError("Responses text.format 必须是对象")
+    format_type = format_value.get("type")
+    if format_type == "text":
+        return StructuredOutputConfig(kind="text")
+    if format_type == "json_object":
+        return StructuredOutputConfig(kind="json_object")
+    if format_type != "json_schema":
+        raise ValueError("Responses text.format.type 必须是 text、json_object 或 json_schema")
+
+    name = format_value.get("name")
+    schema = format_value.get("schema")
+    description = format_value.get("description")
+    strict = format_value.get("strict")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Responses text.format.name 必须是非空字符串")
+    if not isinstance(schema, dict):
+        raise ValueError("Responses text.format.schema 必须是对象")
+    if description is not None and not isinstance(description, str):
+        raise ValueError("Responses text.format.description 必须是字符串")
+    if strict is not None and not isinstance(strict, bool):
+        raise ValueError("Responses text.format.strict 必须是布尔值")
+    return StructuredOutputConfig(
+        kind="json_schema",
+        schema=dict(schema),
+        name=name.strip(),
+        description=description,
+        strict=strict,
+    )
+
+
+def _structured_output_to_responses_format(
+    config: StructuredOutputConfig | None,
+) -> dict[str, object]:
+    if config is None or config.kind == "text":
+        return {"type": "text"}
+    result: dict[str, object] = {"type": config.kind}
+    if config.kind == "json_schema":
+        result["name"] = config.name or "response"
+        result["schema"] = dict(config.schema or {})
+        if config.description is not None:
+            result["description"] = config.description
+        if config.strict is not None:
+            result["strict"] = config.strict
+    return result
 
 
 def _response_part_to_internal(part: dict[str, object], path: str = "content") -> ContentBlock:
@@ -161,6 +220,37 @@ def _response_tool_output_to_internal(output: object, path: str) -> str | tuple[
         raise ValueError(f"Responses {path} 必须是字符串、内容数组或 JSON 值") from exc
 
 
+def _response_reasoning_to_internal(
+    item: dict[str, object],
+    path: str,
+) -> Message | None:
+    raw_parts = item.get("content")
+    parts_path = f"{path}.content"
+    expected_type = "reasoning_text"
+    if raw_parts is None or raw_parts == []:
+        raw_parts = item.get("summary")
+        parts_path = f"{path}.summary"
+        expected_type = "summary_text"
+    if raw_parts is None or raw_parts == []:
+        return None
+    if not isinstance(raw_parts, list):
+        raise ValueError(f"Responses {parts_path} 必须是数组")
+
+    blocks: list[ContentBlock] = []
+    for part_index, part in enumerate(raw_parts):
+        if not isinstance(part, dict):
+            raise ValueError(f"Responses {parts_path}[{part_index}] 必须是对象")
+        if part.get("type") != expected_type:
+            raise ValueError(
+                f"Responses {parts_path}[{part_index}].type 必须是 {expected_type}"
+            )
+        text = part.get("text")
+        if not isinstance(text, str):
+            raise ValueError(f"Responses {parts_path}[{part_index}].text 必须是字符串")
+        blocks.append(ContentBlock(kind="thinking", text=text))
+    return Message(role="assistant", content=tuple(blocks))
+
+
 def _append_internal_message(messages: list[Message], item: dict[str, object], path: str) -> None:
     role = item.get("role")
     if not isinstance(role, str) or role not in _RESPONSES_MESSAGE_ROLES:
@@ -200,6 +290,14 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
 
             if item_type == "message" or (item_type is None and "content" in item):
                 _append_internal_message(messages, item, f"input[{item_index}].content")
+
+            elif item_type == "reasoning":
+                reasoning_message = _response_reasoning_to_internal(
+                    item,
+                    f"input[{item_index}]",
+                )
+                if reasoning_message is not None:
+                    messages.append(reasoning_message)
 
             elif item_type == "function_call_output":
                 call_id = item.get("call_id")
@@ -304,6 +402,8 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
                 raise ValueError("Responses reasoning.effort 必须是非空字符串")
             reasoning_effort = effort.strip()
 
+    structured_output = _text_format_from_responses(payload.get("text"))
+
     max_output_tokens = payload.get("max_output_tokens")
     temperature = payload.get("temperature")
     top_p = payload.get("top_p")
@@ -327,6 +427,7 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
         top_p=top_p if isinstance(top_p, (int, float)) else None,
         tools=tuple(tool for tool in tools if tool.name),
         tool_choice=tool_choice_from_openai(payload.get("tool_choice")),
+        structured_output=structured_output,
         reasoning_effort=reasoning_effort,
         web_search=web_search,
     )
@@ -342,6 +443,7 @@ def internal_to_openai_responses_response(
     model: str,
     *,
     max_output_tokens: int | None = None,
+    structured_output: StructuredOutputConfig | None = None,
 ) -> dict[str, object]:
     """Convert an internal text result to Responses format."""
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -353,6 +455,18 @@ def internal_to_openai_responses_response(
     usage = result.usage
     status = "incomplete" if finish_reason == "length" else "completed"
     incomplete_details = {"reason": "max_output_tokens"} if status == "incomplete" else None
+
+    if message.reasoning_content:
+        output.append({
+            "type": "reasoning",
+            "id": f"rs_{uuid.uuid4().hex[:24]}",
+            "summary": [],
+            "content": [{
+                "type": "reasoning_text",
+                "text": message.reasoning_content,
+            }],
+            "status": status,
+        })
 
     # Build output message item
     msg_content: list[dict[str, object]] = []
@@ -408,7 +522,12 @@ def internal_to_openai_responses_response(
         "parallel_tool_calls": True,
         "previous_response_id": None,
         "store": False,
-        "usage": serialize_openai_responses_usage(usage),
+        "text": {"format": _structured_output_to_responses_format(structured_output)},
+        "usage": serialize_openai_responses_usage(
+            usage,
+            include_output_details=bool(message.reasoning_content),
+            reasoning_tokens=estimate_conservative_tokens(message.reasoning_content or ""),
+        ),
     }
 
 
@@ -425,6 +544,7 @@ class OpenAIResponsesStreamAccumulator:
         model: str,
         usage: TokenUsage | None = None,
         max_output_tokens: int | None = None,
+        structured_output: StructuredOutputConfig | None = None,
     ) -> None:
         self.model = model
         self.response_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -432,16 +552,21 @@ class OpenAIResponsesStreamAccumulator:
         self.started = False
         self.output_index = 0
         self.content_index = 0
-        self.current_type: str | None = None  # "text" or "function_call"
+        self.current_type: str | None = None  # "reasoning", "text", or "function_call"
         self.usage = usage or TokenUsage()
         self.max_output_tokens = max_output_tokens
+        self.structured_output = structured_output
         self.finish_reason = "stop"
         self._text_buffer = ""
         self._full_text = ""  # accumulated full text for message done event
+        self._reasoning_buffer = ""
+        self._full_reasoning = ""
         self._current_msg_id: str | None = None
+        self._current_reasoning_id: str | None = None
         self._current_fc_id: str | None = None
         self._pending_tool_calls: dict[int, dict[str, str]] = {}
         self._message_started = False
+        self._reasoning_started = False
         self._content_part_started = False
         self._completed_output: list[dict[str, object]] = []
         self._finished = False
@@ -450,7 +575,11 @@ class OpenAIResponsesStreamAccumulator:
     def _base_response(self, status: str = "in_progress") -> dict[str, object]:
         usage: dict[str, object] | None = None
         if status in {"completed", "incomplete"}:
-            usage = serialize_openai_responses_usage(self.usage, include_output_details=True)
+            usage = serialize_openai_responses_usage(
+                self.usage,
+                include_output_details=True,
+                reasoning_tokens=estimate_conservative_tokens(self._full_reasoning),
+            )
         incomplete_details = {"reason": "max_output_tokens"} if status == "incomplete" else None
         return {
             "id": self.response_id,
@@ -469,7 +598,7 @@ class OpenAIResponsesStreamAccumulator:
             "reasoning": {"effort": None, "summary": None},
             "store": False,
             "temperature": 1,
-            "text": {"format": {"type": "text"}},
+            "text": {"format": _structured_output_to_responses_format(self.structured_output)},
             "tool_choice": "auto",
             "tools": [],
             "top_p": 1,
@@ -494,7 +623,22 @@ class OpenAIResponsesStreamAccumulator:
         if event.usage is not None:
             self.usage = event.usage
 
-        if event.kind == "text_delta" and event.text:
+        if event.kind == "reasoning_delta" and event.reasoning_content:
+            if not self._reasoning_started:
+                events.extend(self._start_reasoning_output())
+            events.append(self.sse("response.reasoning_text.delta", {
+                "type": "response.reasoning_text.delta",
+                "item_id": self._current_reasoning_id,
+                "output_index": self.output_index,
+                "content_index": 0,
+                "delta": event.reasoning_content,
+            }))
+            self._reasoning_buffer += event.reasoning_content
+            self._full_reasoning += event.reasoning_content
+
+        elif event.kind == "text_delta" and event.text:
+            if self._reasoning_started:
+                events.extend(self._end_reasoning_output())
             if not self._message_started:
                 events.extend(self._start_message_output())
             if not self._content_part_started:
@@ -512,6 +656,8 @@ class OpenAIResponsesStreamAccumulator:
         elif event.kind == "tool_call_delta" and event.tool_call is not None:
             delta = event.tool_call
             if delta.index not in self._pending_tool_calls:
+                if self._reasoning_started:
+                    events.extend(self._end_reasoning_output())
                 if self._content_part_started:
                     events.extend(self._end_content_part())
                 if self._message_started:
@@ -607,6 +753,55 @@ class OpenAIResponsesStreamAccumulator:
             "item": msg_item,
         })]
 
+    def _start_reasoning_output(self) -> list[str]:
+        self._current_reasoning_id = f"rs_{uuid.uuid4().hex[:24]}"
+        self._reasoning_started = True
+        self.current_type = "reasoning"
+        item: dict[str, object] = {
+            "type": "reasoning",
+            "id": self._current_reasoning_id,
+            "summary": [],
+            "content": [],
+            "status": "in_progress",
+        }
+        return [self.sse("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": self.output_index,
+            "item": item,
+        })]
+
+    def _end_reasoning_output(self) -> list[str]:
+        status = "incomplete" if self.finish_reason == "length" else "completed"
+        item: dict[str, object] = {
+            "type": "reasoning",
+            "id": self._current_reasoning_id,
+            "summary": [],
+            "content": [{
+                "type": "reasoning_text",
+                "text": self._reasoning_buffer,
+            }],
+            "status": status,
+        }
+        events = [
+            self.sse("response.reasoning_text.done", {
+                "type": "response.reasoning_text.done",
+                "item_id": self._current_reasoning_id,
+                "output_index": self.output_index,
+                "content_index": 0,
+                "text": self._reasoning_buffer,
+            }),
+            self.sse("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": self.output_index,
+                "item": item,
+            }),
+        ]
+        self._completed_output.append(item)
+        self._reasoning_started = False
+        self._reasoning_buffer = ""
+        self.output_index += 1
+        return events
+
     def _start_content_part(self) -> list[str]:
         self._content_part_started = True
         part: dict[str, object] = {"type": "output_text", "text": "", "annotations": []}
@@ -665,6 +860,8 @@ class OpenAIResponsesStreamAccumulator:
             return []
         self._finished = True
         events: list[str] = []
+        if self._reasoning_started:
+            events.extend(self._end_reasoning_output())
         if self._content_part_started:
             events.extend(self._end_content_part())
         if self._message_started:

@@ -6,6 +6,8 @@ request model used by the shared GLM pipeline.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import time
 import uuid
@@ -15,6 +17,7 @@ from ....config import DEFAULT_CHAT_MODEL_NAME
 from ....core.models import (
     ContentBlock,
     Message,
+    StructuredOutputConfig,
     TextGenerationRequest,
     TextGenerationResponse,
     TextStreamEvent,
@@ -29,7 +32,21 @@ from ...sse import CLIENT_DISCONNECTED, SSEWriter
 _SUPPORTED_ANTHROPIC_MESSAGE_BLOCK_TYPES = frozenset(
     {"text", "image", "document", "thinking", "redacted_thinking", "tool_use", "tool_result"}
 )
-_SUPPORTED_ANTHROPIC_MESSAGE_ROLES = frozenset({"user", "assistant"})
+_SUPPORTED_ANTHROPIC_MESSAGE_ROLES = frozenset({"user", "assistant", "system"})
+_SUPPORTED_ANTHROPIC_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def _output_format_from_anthropic(value: object) -> StructuredOutputConfig | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Anthropic output_config.format 必须是对象")
+    if value.get("type") != "json_schema":
+        raise ValueError("Anthropic output_config.format.type 必须是 json_schema")
+    schema = value.get("schema")
+    if not isinstance(schema, dict):
+        raise ValueError("Anthropic output_config.format.schema 必须是对象")
+    return StructuredOutputConfig(kind="json_schema", schema=dict(schema))
 
 _ANTHROPIC_NON_INPUT_FIELDS = frozenset(
     {
@@ -55,6 +72,12 @@ def serialize_anthropic_usage(usage: TokenUsage) -> dict[str, int]:
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
     }
+
+
+def _compatibility_thinking_signature(thinking: str) -> str:
+    """Return a stable opaque token for reasoning produced outside Anthropic."""
+    digest = hashlib.sha256(thinking.encode("utf-8")).digest()
+    return base64.b64encode(b"glm2api:v1:" + digest).decode("ascii")
 
 
 def estimate_anthropic_input_tokens(payload: object) -> int:
@@ -277,8 +300,36 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
             raise ValueError(f"Anthropic messages[{message_index}] 必须是对象")
         role = msg.get("role")
         if not isinstance(role, str) or role not in _SUPPORTED_ANTHROPIC_MESSAGE_ROLES:
-            raise ValueError(f"Anthropic messages[{message_index}].role 必须是 user 或 assistant")
+            raise ValueError(
+                f"Anthropic messages[{message_index}].role 必须是 user、assistant 或 system"
+            )
         content = msg.get("content")
+
+        if role == "system":
+            if "clear_at" in msg:
+                raise ValueError(
+                    f"Anthropic messages[{message_index}].clear_at 暂不支持"
+                )
+            if "output_config" in msg:
+                raise ValueError(
+                    f"Anthropic messages[{message_index}].output_config 暂不支持"
+                )
+            if isinstance(content, list):
+                text_parts: list[str] = []
+                for block_index, raw_block in enumerate(content):
+                    block = _validated_block(
+                        raw_block,
+                        f"messages[{message_index}].content[{block_index}]",
+                        frozenset({"text"}),
+                    )
+                    text = block.get("text")
+                    if not isinstance(text, str):
+                        raise ValueError(
+                            f"Anthropic messages[{message_index}].content[{block_index}].text 必须是字符串"
+                        )
+                    text_parts.append(text)
+                messages.append(Message(role="system", content="\n".join(text_parts)))
+                continue
 
         if isinstance(content, str):
             messages.append(Message(role=role, content=content))
@@ -490,9 +541,24 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
         else:
             raise ValueError(f"Anthropic tool_choice.type 暂不支持: {choice_type or '<missing>'}")
 
-    # --- thinking ---
+    # --- output config and thinking ---
+    output_config = payload.get("output_config")
+    output_effort: str | None = None
+    structured_output: StructuredOutputConfig | None = None
+    if output_config is not None:
+        if not isinstance(output_config, dict):
+            raise ValueError("Anthropic output_config 必须是对象")
+        structured_output = _output_format_from_anthropic(output_config.get("format"))
+        effort = output_config.get("effort")
+        if effort is not None:
+            if not isinstance(effort, str) or effort not in _SUPPORTED_ANTHROPIC_EFFORT_LEVELS:
+                raise ValueError(
+                    "Anthropic output_config.effort 必须是 low、medium、high、xhigh 或 max"
+                )
+            output_effort = effort
+
     thinking = payload.get("thinking")
-    reasoning_effort: str | None = None
+    reasoning_effort: str | None = output_effort
     if thinking is not None:
         if not isinstance(thinking, dict):
             raise ValueError("Anthropic thinking 必须是对象")
@@ -501,8 +567,17 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
             budget_tokens = thinking.get("budget_tokens", "medium")
             if isinstance(budget_tokens, bool) or not isinstance(budget_tokens, (int, str)):
                 raise ValueError("Anthropic thinking.budget_tokens 类型无效")
-            reasoning_effort = str(budget_tokens)
-        elif thinking_type not in {None, "disabled"}:
+            reasoning_effort = output_effort or str(budget_tokens)
+        elif thinking_type == "adaptive":
+            display = thinking.get("display")
+            if display == "omitted":
+                raise ValueError("Anthropic thinking.display=omitted 暂不支持")
+            if display not in {None, "summarized"}:
+                raise ValueError("Anthropic thinking.display 必须是 summarized 或 omitted")
+            reasoning_effort = output_effort or "high"
+        elif thinking_type == "disabled":
+            reasoning_effort = None
+        elif thinking_type is not None:
             raise ValueError(f"Anthropic thinking.type 暂不支持: {thinking_type}")
 
     stop_sequences = payload.get("stop_sequences")
@@ -510,6 +585,8 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
         raise ValueError("Anthropic stop_sequences 必须是数组")
     if isinstance(stop_sequences, list) and any(not isinstance(item, str) for item in stop_sequences):
         raise ValueError("Anthropic stop_sequences 的元素必须是字符串")
+    if isinstance(stop_sequences, list) and any(item == "" for item in stop_sequences):
+        raise ValueError("Anthropic stop_sequences 的元素不能为空")
     stop = tuple(stop_sequences) if isinstance(stop_sequences, list) and stop_sequences else None
     max_tokens = payload.get("max_tokens")
     max_output_tokens = payload.get("max_output_tokens")
@@ -538,6 +615,7 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
         stop=stop,
         tools=tuple(tools),
         tool_choice=normalized_tool_choice,
+        structured_output=structured_output,
         reasoning_effort=reasoning_effort,
         web_search=web_search,
     )
@@ -559,6 +637,17 @@ def internal_to_anthropic_messages_response(
     finish_reason = result.finish_reason
     usage = result.usage
 
+    has_structured_thinking = (
+        isinstance(message.content, tuple)
+        and any(block.kind == "thinking" for block in message.content)
+    )
+    if message.reasoning_content and not has_structured_thinking:
+        content.append({
+            "type": "thinking",
+            "thinking": message.reasoning_content,
+            "signature": _compatibility_thinking_signature(message.reasoning_content),
+        })
+
     # text content
     if isinstance(message.content, str) and message.content:
         content.append({"type": "text", "text": message.content})
@@ -568,11 +657,15 @@ def internal_to_anthropic_messages_response(
                 content.append({"type": "text", "text": block.text})
             elif block.kind == "thinking":
                 signature = block.metadata.get("signature")
-                if isinstance(signature, str) and signature:
-                    thinking_block = dict(block.metadata)
-                    thinking_block["type"] = "thinking"
-                    thinking_block["thinking"] = block.text or ""
-                    content.append(thinking_block)
+                thinking_block = dict(block.metadata)
+                thinking_block["type"] = "thinking"
+                thinking_block["thinking"] = block.text or ""
+                thinking_block["signature"] = (
+                    signature
+                    if isinstance(signature, str) and signature
+                    else _compatibility_thinking_signature(block.text or "")
+                )
+                content.append(thinking_block)
             elif block.kind == "redacted_thinking":
                 data = block.metadata.get("data")
                 if isinstance(data, str) and data:
@@ -597,6 +690,8 @@ def internal_to_anthropic_messages_response(
 
     if finish_reason == "length":
         stop_reason = "max_tokens"
+    elif result.stop_sequence is not None and not message.tool_calls:
+        stop_reason = "stop_sequence"
 
     if not content:
         content.append({"type": "text", "text": ""})
@@ -608,7 +703,7 @@ def internal_to_anthropic_messages_response(
         "content": content,
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
+        "stop_sequence": result.stop_sequence if stop_reason == "stop_sequence" else None,
         "usage": serialize_anthropic_usage(usage),
     }
 
@@ -635,7 +730,9 @@ class AnthropicMessagesStreamAccumulator:
         self.usage = usage or TokenUsage()
         self._initial_input_tokens = self.usage.input_tokens
         self.stop_reason = "end_turn"
+        self.stop_sequence: str | None = None
         self._pending_tool_calls: dict[int, dict[str, object]] = {}
+        self._thinking_parts: list[str] = []
         self._block_open = False
         self._finished = False
 
@@ -663,15 +760,22 @@ class AnthropicMessagesStreamAccumulator:
             self.usage = event.usage
 
         if event.kind == "reasoning_delta" and event.reasoning_content:
-            # GLM reasoning is not accompanied by an Anthropic-verifiable
-            # signature.  Do not emit an invalid thinking block; retain the
-            # reasoning only inside the GLM pipeline for tool-call parsing.
-            pass
+            if self.current_block_type != "thinking":
+                if self._block_open:
+                    events.extend(self._close_content_block())
+                events.append(self._content_block_start("thinking", {"thinking": "", "signature": ""}))
+                self.current_block_type = "thinking"
+            self._thinking_parts.append(event.reasoning_content)
+            events.append(self._sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": self.content_index,
+                "delta": {"type": "thinking_delta", "thinking": event.reasoning_content},
+            }))
 
         elif event.kind == "text_delta" and event.text:
             if self.current_block_type != "text":
                 if self._block_open:
-                    events.append(self._content_block_stop())
+                    events.extend(self._close_content_block())
                 events.append(self._content_block_start("text", {"text": ""}))
                 self.current_block_type = "text"
             events.append(self._sse("content_block_delta", {
@@ -684,7 +788,7 @@ class AnthropicMessagesStreamAccumulator:
             delta = event.tool_call
             if delta.index not in self._pending_tool_calls:
                 if self._block_open:
-                    events.append(self._content_block_stop())
+                    events.extend(self._close_content_block())
                 tool_id = delta.id or f"toolu_{uuid.uuid4().hex[:24]}"
                 tool_name = delta.name or ""
                 self._pending_tool_calls[delta.index] = {
@@ -714,6 +818,9 @@ class AnthropicMessagesStreamAccumulator:
                 self.stop_reason = "max_tokens"
             elif event.finish_reason == "tool_calls":
                 self.stop_reason = "tool_use"
+            elif event.stop_sequence is not None:
+                self.stop_reason = "stop_sequence"
+                self.stop_sequence = event.stop_sequence
 
         elif event.kind == "done":
             events.extend(self.finish())
@@ -727,13 +834,16 @@ class AnthropicMessagesStreamAccumulator:
         self._finished = True
         events: list[str] = []
         if self._block_open:
-            events.append(self._content_block_stop())
+            events.extend(self._close_content_block())
         delta_usage = {"output_tokens": self.usage.output_tokens}
         if self.usage.input_tokens != self._initial_input_tokens:
             delta_usage["input_tokens"] = self.usage.input_tokens
         events.append(self._sse("message_delta", {
             "type": "message_delta",
-            "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
+            "delta": {
+                "stop_reason": self.stop_reason,
+                "stop_sequence": self.stop_sequence,
+            },
             "usage": delta_usage,
         }))
         events.append(self._sse("message_stop", {"type": "message_stop"}))
@@ -758,6 +868,22 @@ class AnthropicMessagesStreamAccumulator:
         self.content_index += 1
         self._block_open = False
         return event
+
+    def _close_content_block(self) -> list[str]:
+        events: list[str] = []
+        if self.current_block_type == "thinking":
+            thinking = "".join(self._thinking_parts)
+            events.append(self._sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": self.content_index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": _compatibility_thinking_signature(thinking),
+                },
+            }))
+            self._thinking_parts.clear()
+        events.append(self._content_block_stop())
+        return events
 
     def _sse(self, event_type: str, data: dict[str, object]) -> str:
         return f"event: {event_type}\ndata: {_safe_json(data)}\n\n"

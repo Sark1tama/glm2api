@@ -3,6 +3,7 @@
 from .models import (
     ContentBlock,
     Message,
+    StructuredOutputConfig,
     TextGenerationRequest,
     TextGenerationResponse,
     TextStreamEvent,
@@ -16,6 +17,7 @@ from .usage import TokenUsage, estimate_conservative_prompt_tokens, estimate_con
 __all__ = [
     "ContentBlock",
     "Message",
+    "StructuredOutputConfig",
     "TextGenerationRequest",
     "TextGenerationResponse",
     "TextStreamEvent",
