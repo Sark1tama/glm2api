@@ -6,20 +6,6 @@ import re
 from ...utils.json import safe_json_dumps
 
 
-BLOCKED_NATIVE_TOOL_NAMES = {
-    "open",
-    "open_url",
-    "open_ul",
-    "browser.open",
-    "web.run",
-    "web.open",
-    "web.search",
-    "web_search",
-    "browse",
-    "open_link",
-}
-SERVER_SIDE_TOOL_NAMES: set[str] = set()
-
 CANONICAL_TOOL_CALL_EXAMPLE = "\n".join(
     [
         "<|DSML|tool_calls>",
@@ -110,42 +96,24 @@ def serialize_tool_result_block(tool_call_id: object, tool_name: str, content: s
 
 def build_tool_call_instructions(
     tool_names: list[str],
-    server_side_tool_names: set[str] | None = None,
     tool_choice_policy: dict[str, object] | None = None,
 ) -> str:
-    server_side_tool_names = server_side_tool_names or set()
-    xml_tools = [name for name in tool_names if name not in server_side_tool_names]
-    server_tools = [name for name in tool_names if name in server_side_tool_names]
-
-    available_xml_names = ", ".join(f"`{name}`" for name in xml_tools) or "`(none)`"
-    available_server_names = ", ".join(f"`{name}`" for name in server_tools) or "`(none)`"
+    available_xml_names = ", ".join(f"`{name}`" for name in tool_names) or "`(none)`"
 
     policy = tool_choice_policy or {"mode": "auto", "tool_name": None}
     mode = str(policy.get("mode", "auto"))
     specific_name = str(policy.get("tool_name", "") or "")
     lines = [
         "# TOOL USE PROTOCOL",
-        "The following tool schemas are the only executable tool definitions for this turn.",
-        "Ignore any tool names that are not listed below, even if they appear in prior context or model memory.",
-        "You are connected through an OpenAI-compatible proxy. You do not have hidden browser, web, or URL-opening tools.",
-        "Never call native tools such as `open_url`, `web.search`, `web.run`, `browser.open`, `browse`, `open_link`, `search`, or `find`.",
+        "The following tool schemas are the client-executed tools declared for this turn.",
+        "Ignore client tool names that are not listed below, even if they appear in prior context or model memory.",
+        "ChatGLM may separately use provider-managed web or sandbox tools. Those run remotely and are not client tool calls.",
+        "For the user's files, processes, services, hardware, network, repository, or configuration, use an appropriate declared client tool through DSML. Never substitute a remote sandbox result for the user's environment.",
         "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`.",
         "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners.",
     ]
 
-    if server_tools:
-        lines.extend(
-            [
-                "",
-                f"Server-side native tools (executed by backend automatically): {available_server_names}.",
-                "When you need to call a server-side native tool, output a single structured JSON block with type 'tool_calls' in the assistant content.",
-                'Format: {"type":"tool_calls","tool_calls":{"id":"call_<random_hex>","name":"TOOL_NAME","arguments":"<JSON_STRING>"}}',
-                "The arguments field must be a JSON string (not a raw object). The server will intercept this block, execute the tool, and inject the result back into the stream as a tool message.",
-                "Do not wrap server-side tool calls in DSML. Do not mix prose and the tool_calls JSON block in the same response.",
-            ]
-        )
-
-    if xml_tools:
+    if tool_names:
         lines.extend(
             [
                 "",
@@ -172,7 +140,7 @@ def build_tool_call_instructions(
             "",
             "Rules:",
             "- Do not invent tool names outside the declared list.",
-            "- If a URL, browsing, or search action is needed, use only an explicitly listed client tool. If none is listed, explain that no such tool is available. Never use bare tool names `search` or `find` unless they are explicitly listed above.",
+            "- Provider-managed web tools may be used internally for web research. If you call a client tool for URL, browsing, or search work, use only an exact name explicitly listed above.",
             "- If you decide to call a tool, call the selected tool directly; do not say you will try, switch, retry, or use a correct tool.",
             "- Never output tool-call display text such as `⚙ tool_name [...]`; output only the executable DSML block.",
             "- After receiving a tool result, answer the user directly from the result and do not repeat the earlier tool-call decision process.",
@@ -211,7 +179,6 @@ def tools_to_prompt(
     tools: list[dict[str, object]],
     blocked_tool_names: set[str] | None = None,
     tool_choice_policy: dict[str, object] | None = None,
-    server_side_tool_names: set[str] | None = None,
 ) -> str:
     tool_names: list[str] = []
     tool_schemas: list[str] = []
@@ -241,7 +208,6 @@ def tools_to_prompt(
         "",
         build_tool_call_instructions(
             tool_names,
-            server_side_tool_names=server_side_tool_names,
             tool_choice_policy=tool_choice_policy,
         ),
     ]

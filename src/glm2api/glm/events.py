@@ -12,9 +12,11 @@ from ..core.output_budget import OutputTokenBudget, bound_output
 from ..core.usage import TokenUsage, estimate_conservative_tokens
 from ..infrastructure.logging import debug_dump
 from ..utils.json import safe_json_dumps
-from .tools.dsml import BLOCKED_NATIVE_TOOL_NAMES
 from .tools.parser import StreamingToolParser, parse_tool_calls_from_text
 from .translator import sanitize_tool_calls
+
+
+_REMOTE_SANDBOX_TOOL_NAME = "execute_sandbox_code"
 
 
 def effective_event_status(event: dict[str, object]) -> object:
@@ -70,17 +72,17 @@ class GLMUpstreamEventAccumulator:
     _part_reasoning_accumulated: dict[str, str] = field(default_factory=dict)
     _part_text_modes: dict[str, str] = field(default_factory=dict)
     _part_reasoning_modes: dict[str, str] = field(default_factory=dict)
-    _server_side_tool_calls: list[dict[str, object]] = field(default_factory=list)
-    _server_side_tool_call_ids: set[str] = field(default_factory=set)
     _deferred_visible_text: str = ""
     input_tokens_estimate: int = 0
     usage: TokenUsage | None = None
     tool_choice: ToolChoice | None = None
     max_output_tokens: int | None = None
-    _rejected_tool_names: set[str] = field(default_factory=set)
+    _provider_tool_names: set[str] = field(default_factory=set)
     _output_budget: OutputTokenBudget = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.allowed_tool_names is None:
+            self.allowed_tool_names = set()
         self.tool_parser.allowed_tool_names = self.allowed_tool_names
         initial_usage = self.usage or TokenUsage()
         if self.input_tokens_estimate:
@@ -93,6 +95,36 @@ class GLMUpstreamEventAccumulator:
         """Whether a streaming caller can stop consuming the GLM response."""
         return self._output_budget.limit_reached
 
+    @property
+    def provider_tool_names(self) -> frozenset[str]:
+        return frozenset(self._provider_tool_names)
+
+    @property
+    def remote_sandbox_used(self) -> bool:
+        return _REMOTE_SANDBOX_TOOL_NAME in self._provider_tool_names
+
+    def has_client_tool_call(self) -> bool:
+        """Return whether this attempt produced a request-declared client call."""
+        if self.allowed_tool_names is None:
+            return False
+        full_text, full_reasoning = self._render_full_output()
+        _, text_calls = parse_tool_calls_from_text(
+            full_text.strip(),
+            allowed_tool_names=self.allowed_tool_names,
+        )
+        if sanitize_tool_calls(text_calls, fallback_url=self.fallback_tool_url):
+            return True
+        return bool(self._extract_reasoning_tool_calls(full_reasoning))
+
+    def usage_snapshot(self) -> TokenUsage:
+        """Return usage observed so far for a discarded upstream attempt."""
+        full_text, full_reasoning = self._render_full_output()
+        return self._build_usage(
+            [],
+            output_text=full_text,
+            output_reasoning=full_reasoning,
+        )
+
     def consume_event(self, payload: dict[str, object]) -> tuple[list[TextStreamEvent], str | None]:
         """Consume one ChatGLM upstream event into protocol-neutral events."""
         debug_dump(self.logger or logging.getLogger("glm2api.null"), self.debug_enabled, "GLM SSE 解析事件", payload)
@@ -104,6 +136,8 @@ class GLMUpstreamEventAccumulator:
         authoritative_snapshot = (payload_status or "").lower() in {"finish", "intervene", "done"}
 
         for part in payload.get("parts", []) if isinstance(payload.get("parts"), list) else []: # pyright: ignore[reportGeneralTypeIssues]
+            if isinstance(part, dict):
+                self._record_provider_tool_activity(part)
             if isinstance(part, dict) and part.get("logic_id"):
                 logic_id = str(part["logic_id"])
                 if logic_id not in self.parts_by_logic_id:
@@ -128,37 +162,6 @@ class GLMUpstreamEventAccumulator:
                     part_reasoning,
                     authoritative_snapshot=authoritative_snapshot,
                 )
-            # Extract server-side native tool_calls from content items
-            if isinstance(part, dict) and isinstance(part.get("content"), list):
-                for content in part["content"]:
-                    if isinstance(content, dict) and content.get("type") == "tool_calls":
-                        tool_calls_data = content.get("tool_calls")
-                        if isinstance(tool_calls_data, dict):
-                            tool_name = str(tool_calls_data.get("name", "")).strip()
-                            tool_id = str(tool_calls_data.get("id", "")).strip()
-                            arguments = tool_calls_data.get("arguments", "{}")
-                            if (
-                                self.allowed_tool_names is None
-                                or tool_name in BLOCKED_NATIVE_TOOL_NAMES
-                                or tool_name not in self.allowed_tool_names
-                            ):
-                                if tool_name:
-                                    self._rejected_tool_names.add(tool_name)
-                                continue
-                            if tool_name and tool_id and tool_id not in self._server_side_tool_call_ids:
-                                self._server_side_tool_call_ids.add(tool_id)
-                                self._server_side_tool_calls.append(
-                                    {
-                                        "id": tool_id,
-                                        "type": "function",
-                                        "index": len(self._server_side_tool_calls),
-                                        "function": {
-                                            "name": tool_name,
-                                            "arguments": str(arguments) if isinstance(arguments, str) else safe_json_dumps(arguments),
-                                        },
-                                    }
-                                )
-
         text_delta, reasoning_delta = self._compute_deltas()
         self.last_full_text = self._cached_full_text
         self.last_full_reasoning = self._cached_full_reasoning
@@ -175,7 +178,7 @@ class GLMUpstreamEventAccumulator:
 
         visible_text_delta = self.tool_parser.consume(text_delta)
         if visible_text_delta:
-            if self.allowed_tool_names is not None:
+            if self.allowed_tool_names:
                 self._deferred_visible_text += visible_text_delta
             else:
                 accepted_visible_text = self._output_budget.accept_text(visible_text_delta)
@@ -199,6 +202,33 @@ class GLMUpstreamEventAccumulator:
         )
         return events, payload_status
 
+    def _record_provider_tool_activity(self, part: dict[str, object]) -> None:
+        meta_data = part.get("meta_data")
+        observed_names: set[str] = set()
+
+        if isinstance(meta_data, dict):
+            tool_result_extra = meta_data.get("tool_result_extra")
+            if isinstance(tool_result_extra, dict):
+                tool_name = str(tool_result_extra.get("tool_call_name", "")).strip()
+                if tool_name and tool_name != "finish":
+                    observed_names.add(tool_name)
+
+        if isinstance(part.get("content"), list):
+            for content in part["content"]:
+                if not isinstance(content, dict) or content.get("type") not in {"tool_calls", "tool_result"}:
+                    continue
+                tool_call = content.get("tool_calls")
+                if isinstance(tool_call, dict):
+                    tool_name = str(tool_call.get("name", "")).strip()
+                    if tool_name and tool_name != "finish":
+                        observed_names.add(tool_name)
+
+        new_names = observed_names - self._provider_tool_names
+        self._provider_tool_names.update(observed_names)
+        if self.logger:
+            for tool_name in sorted(new_names):
+                self.logger.info("检测到 GLM Provider 工具活动 tool=%s", tool_name)
+
     def finalize(
         self,
         status: str | None,
@@ -213,12 +243,12 @@ class GLMUpstreamEventAccumulator:
 
         if self.logger:
             self.logger.info(
-                "响应收尾 status=%s text_len=%s reasoning_len=%s tool_calls=%s server_tools=%s",
+                "响应收尾 status=%s text_len=%s reasoning_len=%s tool_calls=%s provider_tools=%s",
                 status,
                 len(self._cached_full_text),
                 len(self._cached_full_reasoning),
                 len(xml_tool_calls),
-                len(self._server_side_tool_calls),
+                ",".join(sorted(self._provider_tool_names)) or "(none)",
             )
 
         events: list[TextStreamEvent] = []
@@ -436,7 +466,7 @@ class GLMUpstreamEventAccumulator:
         if not xml_tool_calls:
             xml_tool_calls = self._extract_reasoning_tool_calls(source_reasoning)
 
-        all_tool_calls: list[dict[str, object]] = list(self._server_side_tool_calls)
+        all_tool_calls: list[dict[str, object]] = []
         for tool_call in xml_tool_calls:
             normalized_call = dict(tool_call)
             normalized_call["index"] = len(all_tool_calls)
@@ -469,8 +499,6 @@ class GLMUpstreamEventAccumulator:
             for call in all_tool_calls
             if isinstance(call.get("function"), dict)
         ]
-        attempted_names.extend(sorted(self._rejected_tool_names))
-
         if choice.mode == "none":
             if actual_names or attempted_names:
                 raise ValueError("tool_choice=none 时模型输出了工具调用")

@@ -10,16 +10,18 @@ import uuid
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BufferedReader, BytesIO
 from logging import Logger
 from typing import Callable, Iterator
 
 from ..config import AppConfig, DEFAULT_CHAT_MODEL_NAME
 from ..core.models import (
+    Message,
     TextGenerationRequest,
     TextGenerationResponse,
     TextStreamEvent,
+    ToolChoice,
     ToolDefinition,
 )
 from ..core.usage import TokenUsage, estimate_conservative_prompt_tokens
@@ -28,7 +30,6 @@ from .auth import GLMAccessTokenManager, build_sign
 from .chat import get_model_multimodal_capability, resolve_chat_mode, resolve_networking, resolve_upstream_model
 from .errors import QueueTimeoutError, UpstreamAPIError
 from .events import GLMUpstreamEventAccumulator, effective_event_status, is_nonzero_status
-from .tools.dsml import BLOCKED_NATIVE_TOOL_NAMES, SERVER_SIDE_TOOL_NAMES
 from .translator import convert_messages_to_glm_prompt, extract_recent_user_url, messages_to_glm_payload
 
 
@@ -142,13 +143,13 @@ class GLMWebClient:
     def open_video_content(self, video_id: str):
         return self.videos.open_content(video_id)
 
-    def _resolve_tools(self, request: TextGenerationRequest) -> tuple[list[ToolDefinition] | None, set[str] | None]:
+    def _resolve_tools(self, request: TextGenerationRequest) -> tuple[list[ToolDefinition] | None, set[str]]:
         raw_tools = list(request.tools)
         blocked_tool_names = {
             name.strip()
             for name in self.config.blocked_tool_names
             if name.strip()
-        } | BLOCKED_NATIVE_TOOL_NAMES
+        }
         filtered_tools = [tool for tool in raw_tools if tool.name not in blocked_tool_names]
         blocked_names = [tool.name for tool in raw_tools if tool.name in blocked_tool_names]
         if blocked_names:
@@ -163,7 +164,7 @@ class GLMWebClient:
             if tool_choice.mode == "function":
                 if tool_choice.name not in tool_names:
                     raise ValueError(f"tool_choice 指定的工具不可用: {tool_choice.name}")
-        return filtered_tools or None, tool_names or None
+        return filtered_tools or None, tool_names
 
     def _validate_generation_parameters(self, request: TextGenerationRequest) -> None:
         unsupported: list[str] = []
@@ -222,39 +223,52 @@ class GLMWebClient:
     ) -> tuple[TextGenerationResponse, str | None]:
         _, allowed_tool_names = self._resolve_tools(request)
         lease = self.request_queue.acquire(f"chat:{request.model}")
+        preferred_account_index = self.get_preferred_account_index(lease.ticket)
+        attempt_request = request
+        discarded_usage = TokenUsage()
         try:
-            response, assistant_id, usage = self._open_chat_stream(
-                request,
-                preferred_account_index=self.get_preferred_account_index(lease.ticket),
-            )
-        except Exception:
-            lease.release()
-            raise
-        accumulator = GLMUpstreamEventAccumulator(
-            model=request.model,
-            allowed_tool_names=allowed_tool_names,
-            tool_choice=request.tool_choice,
-            fallback_tool_url=extract_recent_user_url(
-                messages_to_glm_payload(request.messages)
-            ),
-            debug_enabled=self.config.debug_dump_all,
-            logger=self.logger,
-            usage=usage,
-            max_output_tokens=request.max_tokens,
-        )
-        try:
-            for event in self.iter_sse_events(response):
-                if not event:
-                    continue
-                self.raise_for_event_error(event, stream=False)
-                _, status = accumulator.consume_event(event)
-                if status in {"finish", "intervene"}:
-                    return accumulator.build_response(), accumulator.conversation_id
+            for attempt in range(2):
+                response, assistant_id, usage = self._open_chat_stream(
+                    attempt_request,
+                    preferred_account_index=preferred_account_index,
+                )
+                accumulator = self._new_event_accumulator(
+                    attempt_request,
+                    allowed_tool_names,
+                    usage,
+                )
+                try:
+                    for event in self.iter_sse_events(response):
+                        if not event:
+                            continue
+                        self.raise_for_event_error(event, stream=False)
+                        _, status = accumulator.consume_event(event)
+                        if status in {"finish", "intervene"}:
+                            break
+                finally:
+                    response.close() # type: ignore
+                    self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
+
+                if self._remote_sandbox_replaced_client_tool(accumulator):
+                    discarded_usage = discarded_usage.plus(accumulator.usage_snapshot())
+                    if attempt == 0 and allowed_tool_names:
+                        self.logger.warning(
+                            "GLM 远程沙箱替代了客户端工具，丢弃结果并重试",
+                        )
+                        attempt_request = self._sandbox_retry_request(request)
+                        continue
+                    self._raise_for_remote_sandbox_substitution(accumulator)
+
+                result = self._add_discarded_usage(
+                    accumulator.build_response(),
+                    discarded_usage,
+                )
+                request.usage = result.usage
+                return result, accumulator.conversation_id
         finally:
-            response.close() # type: ignore
-            self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
             lease.release()
-        return accumulator.build_response(), accumulator.conversation_id
+
+        raise UpstreamAPIError(status_code=502, message="GLM 工具调用重试未返回结果。")
 
     def stream_chat_completion(
         self,
@@ -264,16 +278,108 @@ class GLMWebClient:
         request.stream = True
         _, allowed_tool_names = self._resolve_tools(request)
         lease = self.request_queue.acquire(f"stream:{request.model}")
+        preferred_account_index = self.get_preferred_account_index(lease.ticket)
         try:
             response, assistant_id, usage = self._open_chat_stream(
                 request,
-                preferred_account_index=self.get_preferred_account_index(lease.ticket),
+                preferred_account_index=preferred_account_index,
             )
         except Exception:
             lease.release()
             raise
 
-        accumulator = GLMUpstreamEventAccumulator(
+        request.usage = usage
+
+        def generate():
+            attempt_request = request
+            current_response = response
+            current_assistant_id = assistant_id
+            current_usage = usage
+            discarded_usage = TokenUsage()
+            try:
+                for attempt in range(2):
+                    accumulator = self._new_event_accumulator(
+                        attempt_request,
+                        allowed_tool_names,
+                        current_usage,
+                    )
+                    buffered_events: list[TextStreamEvent] | None = [] if allowed_tool_names else None
+                    completion_status = "stop"
+                    last_error: dict[str, object] | None = None
+                    try:
+                        for event in self.iter_sse_events(current_response, require_done=True):
+                            if not event:
+                                continue
+                            self.raise_for_event_error(event, stream=True)
+                            stream_events, status = accumulator.consume_event(event)
+                            if buffered_events is None:
+                                yield from stream_events
+                            else:
+                                buffered_events.extend(stream_events)
+
+                            if status in {"finish", "intervene"}:
+                                completion_status = status
+                                if isinstance(event.get("last_error"), dict):
+                                    last_error = event["last_error"]
+                                break
+                            elif accumulator.output_budget_exhausted:
+                                completion_status = "length"
+                                break
+                    finally:
+                        current_response.close() # type: ignore
+                        self.delete_conversation(
+                            accumulator.conversation_id,
+                            assistant_id=current_assistant_id,
+                        )
+
+                    if (
+                        completion_status != "length"
+                        and self._remote_sandbox_replaced_client_tool(accumulator)
+                    ):
+                        discarded_usage = discarded_usage.plus(accumulator.usage_snapshot())
+                        if attempt == 0 and allowed_tool_names:
+                            self.logger.warning(
+                                "GLM 远程沙箱替代了客户端工具，丢弃流式结果并重试",
+                            )
+                            attempt_request = self._sandbox_retry_request(request)
+                            current_response, current_assistant_id, current_usage = self._open_chat_stream(
+                                attempt_request,
+                                preferred_account_index=preferred_account_index,
+                            )
+                            continue
+                        self._raise_for_remote_sandbox_substitution(accumulator)
+
+                    final_events = accumulator.finalize(
+                        status=completion_status,
+                        last_error=last_error,
+                    )
+                    if buffered_events is None:
+                        yield from final_events
+                    else:
+                        buffered_events.extend(final_events)
+
+                    if buffered_events is not None:
+                        combined_events = self._add_discarded_stream_usage(
+                            buffered_events,
+                            discarded_usage,
+                        )
+                        for stream_event in combined_events:
+                            if stream_event.usage is not None:
+                                request.usage = stream_event.usage
+                            yield stream_event
+                    return
+            finally:
+                lease.release()
+
+        return generate()
+
+    def _new_event_accumulator(
+        self,
+        request: TextGenerationRequest,
+        allowed_tool_names: set[str],
+        usage: TokenUsage,
+    ) -> GLMUpstreamEventAccumulator:
+        return GLMUpstreamEventAccumulator(
             model=request.model,
             allowed_tool_names=allowed_tool_names,
             tool_choice=request.tool_choice,
@@ -285,34 +391,71 @@ class GLMWebClient:
             usage=usage,
             max_output_tokens=request.max_tokens,
         )
-        request.usage = usage
 
-        def generate():
-            try:
-                for event in self.iter_sse_events(response, require_done=True):
-                    if not event:
-                        continue
-                    self.raise_for_event_error(event, stream=True)
-                    stream_events, status = accumulator.consume_event(event)
-                    yield from stream_events
+    @staticmethod
+    def _sandbox_retry_request(request: TextGenerationRequest) -> TextGenerationRequest:
+        correction = Message(
+            role="system",
+            content=(
+                "# CLIENT TOOL RETRY\n"
+                "The previous upstream attempt used the remote ChatGLM sandbox instead of a declared client tool. "
+                "That result was discarded because the sandbox is not the client's environment. "
+                "Use one of the declared client tools through DSML for this attempt. A client tool call is required."
+            ),
+        )
+        tool_choice = request.tool_choice
+        if tool_choice is None or tool_choice.mode == "auto":
+            tool_choice = ToolChoice(mode="required")
+        return replace(
+            request,
+            messages=(*request.messages, correction),
+            tool_choice=tool_choice,
+            usage=None,
+        )
 
-                    if status in {"finish", "intervene"}:
-                        yield from accumulator.finalize(
-                            status=status,
-                            last_error=event.get("last_error") if isinstance(event.get("last_error"), dict) else None,
-                        )
-                        return
-                    if accumulator.output_budget_exhausted:
-                        yield from accumulator.finalize(status="length")
-                        return
+    @staticmethod
+    def _add_discarded_usage(
+        response: TextGenerationResponse,
+        discarded_usage: TokenUsage,
+    ) -> TextGenerationResponse:
+        if discarded_usage.total_tokens == 0:
+            return response
+        return replace(response, usage=discarded_usage.plus(response.usage))
 
-                yield from accumulator.finalize(status="stop")
-            finally:
-                response.close() # type: ignore
-                self.delete_conversation(accumulator.conversation_id, assistant_id=assistant_id)
-                lease.release()
+    @staticmethod
+    def _add_discarded_stream_usage(
+        events: list[TextStreamEvent],
+        discarded_usage: TokenUsage,
+    ) -> list[TextStreamEvent]:
+        if discarded_usage.total_tokens == 0:
+            return events
+        return [
+            replace(event, usage=discarded_usage.plus(event.usage))
+            if event.usage is not None
+            else event
+            for event in events
+        ]
 
-        return generate()
+    @staticmethod
+    def _remote_sandbox_replaced_client_tool(accumulator: GLMUpstreamEventAccumulator) -> bool:
+        return (
+            bool(accumulator.allowed_tool_names)
+            and accumulator.remote_sandbox_used
+            and not accumulator.has_client_tool_call()
+        )
+
+    @staticmethod
+    def _raise_for_remote_sandbox_substitution(accumulator: GLMUpstreamEventAccumulator) -> None:
+        if not GLMWebClient._remote_sandbox_replaced_client_tool(accumulator):
+            return
+        raise UpstreamAPIError(
+            status_code=502,
+            message=(
+                "GLM 远程沙箱替代了客户端工具，结果不属于客户端环境，已丢弃："
+                "execute_sandbox_code"
+            ),
+            payload={"provider_tools": ["execute_sandbox_code"]},
+        )
 
     def raise_for_event_error(self, event: dict[str, object], stream: bool) -> None:
         raw_status = effective_event_status(event)
@@ -479,7 +622,6 @@ class GLMWebClient:
             tools=filtered_tools,
             blocked_tool_names={name.strip() for name in self.config.blocked_tool_names if name.strip()},
             tool_choice=request.tool_choice,
-            server_side_tool_names=SERVER_SIDE_TOOL_NAMES,
         )
         debug_dump(self.logger, self.config.debug_dump_all, "内部文本请求", request)
         debug_dump(self.logger, self.config.debug_dump_all, "转换后的 GLM messages", converted_messages)

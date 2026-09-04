@@ -19,6 +19,7 @@ from glm2api.api.adapters.openai.chat_completions import openai_chat_completions
 from glm2api.glm.auth import GLMAccessTokenManager
 from glm2api.glm.client import ConcurrentRequestQueue, GLMWebClient, QueueLease, UpstreamAPIError
 from glm2api.glm.errors import QueueTimeoutError
+from glm2api.glm.events import GLMUpstreamEventAccumulator
 from glm2api.core.models import (
     ContentBlock,
     Message,
@@ -137,6 +138,83 @@ def test_glm_client_resolves_tool_choice_before_prompt_translation():
                 tool_choice=ToolChoice(mode="required"),
             )
         )
+
+    filtered_tools, filtered_names = client._resolve_tools(
+        TextGenerationRequest(
+            model="glm-4",
+            messages=(),
+            tools=(
+                ToolDefinition(name="execute_sandbox_code"),
+                ToolDefinition(name="execute_code"),
+            ),
+        )
+    )
+    assert filtered_tools == [
+        ToolDefinition(name="execute_sandbox_code"),
+        ToolDefinition(name="execute_code"),
+    ]
+    assert filtered_names == {"execute_sandbox_code", "execute_code"}
+
+
+def test_glm_client_only_filters_tools_explicitly_blocked_by_configuration():
+    client = GLMWebClient.__new__(GLMWebClient)
+    client.config = SimpleNamespace(blocked_tool_names=["open_url"])
+    client.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
+
+    filtered_tools, filtered_names = client._resolve_tools(
+        TextGenerationRequest(
+            model="glm-4",
+            messages=(),
+            tools=(
+                ToolDefinition(name="open_url"),
+                ToolDefinition(name="web_search"),
+            ),
+        )
+    )
+
+    assert filtered_tools == [ToolDefinition(name="web_search")]
+    assert filtered_names == {"web_search"}
+
+
+def test_glm_client_rejects_remote_sandbox_that_replaces_client_tool():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"terminal"},
+    )
+    accumulator.consume_event(
+        {
+            "parts": [
+                {
+                    "meta_data": {
+                        "tool_result_extra": {"tool_call_name": "execute_sandbox_code"}
+                    }
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(UpstreamAPIError, match="结果不属于客户端环境") as raised:
+        GLMWebClient._raise_for_remote_sandbox_substitution(accumulator)
+
+    assert raised.value.status_code == 502
+    assert raised.value.payload == {"provider_tools": ["execute_sandbox_code"]}
+
+
+def test_glm_client_allows_remote_sandbox_without_client_tools():
+    accumulator = GLMUpstreamEventAccumulator(model="glm-test")
+    accumulator.consume_event(
+        {
+            "parts": [
+                {
+                    "meta_data": {
+                        "tool_result_extra": {"tool_call_name": "execute_sandbox_code"}
+                    }
+                }
+            ]
+        }
+    )
+
+    assert GLMWebClient._remote_sandbox_replaced_client_tool(accumulator) is False
 
 
 def test_glm_client_rejects_generation_parameters_without_web_equivalent():
@@ -1269,6 +1347,26 @@ def test_anthropic_stream_reports_input_and_output_usage():
 
     assert message_start["message"]["usage"]["input_tokens"] == 123
     assert message_delta["usage"] == {"output_tokens": 45}
+
+
+def test_anthropic_stream_corrects_input_usage_after_internal_retry():
+    accumulator = AnthropicMessagesStreamAccumulator(
+        model="glm-5.3-flash",
+        usage=TokenUsage.estimated(input_tokens=100),
+    )
+    events = [accumulator.start_message()]
+    events.extend(accumulator.feed_event(
+        TextStreamEvent(
+            kind="finish",
+            finish_reason="tool_calls",
+            usage=TokenUsage.estimated(input_tokens=210, output_tokens=20),
+        )
+    ))
+    events.extend(accumulator.feed_event(TextStreamEvent(kind="done")))
+
+    message_delta = json.loads(events[-2].split("data: ", 1)[1])
+
+    assert message_delta["usage"] == {"input_tokens": 210, "output_tokens": 20}
 
 
 def test_glm_client_raises_for_sse_error_event():

@@ -44,3 +44,14 @@ def test_partial_upstream_usage_is_marked_mixed_and_keeps_the_other_estimate():
     assert usage.source == "mixed"
     assert usage.input_tokens == 7
     assert usage.output_tokens == 80
+
+
+def test_usage_plus_sums_retry_attempts_and_keeps_conservative_provenance():
+    first = TokenUsage.estimated(input_tokens=10, output_tokens=3)
+    second = TokenUsage.from_upstream({"prompt_tokens": 7, "completion_tokens": 2})
+
+    combined = first.plus(second)
+
+    assert combined.input_tokens == 17
+    assert combined.output_tokens == 5
+    assert combined.source == "estimated"

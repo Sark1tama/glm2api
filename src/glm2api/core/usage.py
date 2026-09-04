@@ -132,6 +132,15 @@ class TokenUsage:
             output_source = "upstream"
         return self._from_fields(next_input, next_output, input_source, output_source)
 
+    def plus(self, other: "TokenUsage") -> "TokenUsage":
+        """Add usage from another upstream attempt without overstating precision."""
+        return self._from_fields(
+            self.input_tokens + other.input_tokens,
+            self.output_tokens + other.output_tokens,
+            self._sum_field_source(self._input_source, other._input_source),
+            self._sum_field_source(self._output_source, other._output_source),
+        )
+
     @classmethod
     def _from_fields(
         cls,
@@ -156,6 +165,15 @@ class TokenUsage:
         if len(sources) == 1:
             return next(iter(sources))  # type: ignore[return-value]
         return "mixed"
+
+    @staticmethod
+    def _sum_field_source(left: _FieldSource | None, right: _FieldSource | None) -> _FieldSource:
+        sources = {left or "unavailable", right or "unavailable"} - {"unavailable"}
+        if not sources:
+            return "unavailable"
+        if sources == {"upstream"}:
+            return "upstream"
+        return "estimated"
 
 
 def _parse_count(value: object) -> int | None:

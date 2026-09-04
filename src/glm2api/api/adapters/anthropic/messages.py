@@ -633,6 +633,7 @@ class AnthropicMessagesStreamAccumulator:
         self.content_index = 0
         self.current_block_type: str | None = None
         self.usage = usage or TokenUsage()
+        self._initial_input_tokens = self.usage.input_tokens
         self.stop_reason = "end_turn"
         self._pending_tool_calls: dict[int, dict[str, object]] = {}
         self._block_open = False
@@ -727,10 +728,13 @@ class AnthropicMessagesStreamAccumulator:
         events: list[str] = []
         if self._block_open:
             events.append(self._content_block_stop())
+        delta_usage = {"output_tokens": self.usage.output_tokens}
+        if self.usage.input_tokens != self._initial_input_tokens:
+            delta_usage["input_tokens"] = self.usage.input_tokens
         events.append(self._sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": self.usage.output_tokens},
+            "usage": delta_usage,
         }))
         events.append(self._sse("message_stop", {"type": "message_stop"}))
         return events

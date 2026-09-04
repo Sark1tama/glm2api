@@ -15,8 +15,6 @@ from ..core.models import (
     ToolDefinition,
 )
 from .tools.dsml import (
-    BLOCKED_NATIVE_TOOL_NAMES,
-    SERVER_SIDE_TOOL_NAMES,
     filter_tools,
     serialize_tool_call_block,
     serialize_tool_result_block,
@@ -308,7 +306,6 @@ def convert_messages_to_glm_prompt(
     tools: Sequence[ToolDefinition] | None,
     blocked_tool_names: set[str] | None = None,
     tool_choice: ToolChoice | None = None,
-    server_side_tool_names: set[str] | None = None,
 ) -> list[dict[str, object]]:
     chat_messages = messages_to_glm_payload(messages)
     chat_tools = [tool_definition_to_glm_payload(tool) for tool in (tools or [])]
@@ -319,7 +316,6 @@ def convert_messages_to_glm_prompt(
         if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
     }
     available_tool_names.discard("")
-    server_side_tool_names = server_side_tool_names or SERVER_SIDE_TOOL_NAMES
     tool_choice_policy = parse_tool_choice_policy(tool_choice, available_tool_names)
     processed: list[dict[str, str]] = []
     latest_user_url: str | None = extract_recent_user_url(chat_messages)
@@ -392,15 +388,13 @@ def convert_messages_to_glm_prompt(
             processed.append({"role": role, "content": text})
 
     transcript_parts: list[str] = []
+    tool_prompt: str | None = None
 
     if filtered_tools and tool_choice_policy.get("mode") != "none":
-        transcript_parts.append(
-            tools_to_prompt(
-                filtered_tools,
-                blocked_tool_names=blocked_tool_names,
-                tool_choice_policy=tool_choice_policy,
-                server_side_tool_names=server_side_tool_names,
-            )
+        tool_prompt = tools_to_prompt(
+            filtered_tools,
+            blocked_tool_names=blocked_tool_names,
+            tool_choice_policy=tool_choice_policy,
         )
         transcript_parts.append("# CONVERSATION")
 
@@ -414,12 +408,13 @@ def convert_messages_to_glm_prompt(
         )
         transcript_parts.append(f"{title}: {item['content']}".strip())
 
+    if tool_prompt:
+        transcript_parts.append(tool_prompt)
+
     prompt = "\n\n".join(part for part in transcript_parts if part).strip()
     return [{"role": "user", "content": [{"type": "text", "text": prompt + "\n\nAssistant: "}]}]
 
 __all__ = [
-    "BLOCKED_NATIVE_TOOL_NAMES",
-    "SERVER_SIDE_TOOL_NAMES",
     "convert_messages_to_glm_prompt",
     "content_block_to_glm_payload",
     "extract_first_url",

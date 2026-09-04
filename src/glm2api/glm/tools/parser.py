@@ -6,8 +6,6 @@ import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
-from .dsml import BLOCKED_NATIVE_TOOL_NAMES
-
 CODE_FENCE_PATTERN = re.compile(r"```[\s\S]*?```")
 TOOL_RESULT_PATTERN = re.compile(
     r"<(?:(?:\|DSML\|)|ml_)?tool_result\b[\s\S]*?</(?:(?:\|DSML\|)|ml_)?tool_result>",
@@ -109,6 +107,12 @@ def _repair_malformed_dsml(block: str) -> str:
             repaired,
             flags=re.IGNORECASE,
         )
+    repaired = re.sub(
+        r"<\|dsml\|invoke\s*\|?\s*>",
+        "</|DSML|invoke>",
+        repaired,
+        flags=re.IGNORECASE,
+    )
 
     def replace_open(match: re.Match[str]) -> str:
         name = _canonical_dsml_name(match.group("name"))
@@ -137,8 +141,6 @@ def _normalize_dsml_to_xml(block: str) -> str:
 
 
 def _is_allowed_tool_name(tool_name: str, allowed_tool_names: set[str] | None) -> bool:
-    if tool_name in BLOCKED_NATIVE_TOOL_NAMES:
-        return False
     return allowed_tool_names is None or tool_name in allowed_tool_names
 
 

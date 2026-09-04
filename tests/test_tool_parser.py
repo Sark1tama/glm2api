@@ -37,8 +37,8 @@ def test_parse_tool_calls_from_canonical_invoke_markup():
     )
 
 
-def test_parse_rejects_undeclared_and_blocked_native_tools():
-    blocked_text = (
+def test_parse_accepts_any_declared_name_and_rejects_undeclared_tools():
+    declared_text = (
         "<|DSML|tool_calls><|DSML|invoke name=\"open_url\">"
         "<|DSML|parameter name=\"url\">https://example.com</|DSML|parameter>"
         "</|DSML|invoke></|DSML|tool_calls>"
@@ -49,9 +49,9 @@ def test_parse_rejects_undeclared_and_blocked_native_tools():
         "</|DSML|invoke></|DSML|tool_calls>"
     )
 
-    clean, tool_calls = parse_tool_calls_from_text(blocked_text, {"open_url"})
+    clean, tool_calls = parse_tool_calls_from_text(declared_text, {"open_url"})
     assert clean == ""
-    assert tool_calls == []
+    assert [call["function"]["name"] for call in tool_calls] == ["open_url"]
 
     clean, tool_calls = parse_tool_calls_from_text(undeclared_text, {"allowed_tool"})
     assert clean == ""
@@ -154,6 +154,21 @@ def test_parse_tool_calls_repairs_double_pipe_dsml_close_tag():
     assert clean == ""
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["arguments"] == '{"command":["powershell.exe","-Command","pwd"]}'
+
+
+def test_parse_tool_calls_repairs_invoke_close_without_slash():
+    text = (
+        '<|DSML|tool_calls><|DSML|invoke name="open_url">'
+        '<|DSML|parameter name="token"><![CDATA[client-only-value]]></|DSML|parameter>'
+        '<|DSML|invoke></|DSML|tool_calls>'
+    )
+
+    clean, tool_calls = parse_tool_calls_from_text(text, {"open_url"})
+
+    assert clean == ""
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "open_url"
+    assert tool_calls[0]["function"]["arguments"] == '{"token":"client-only-value"}'
 
 
 def test_parse_tool_calls_repairs_single_bracket_cdata_close():

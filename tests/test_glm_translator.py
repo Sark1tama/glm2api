@@ -1,9 +1,9 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from glm2api.glm.events import GLMUpstreamEventAccumulator
-from glm2api.glm.tools.dsml import BLOCKED_NATIVE_TOOL_NAMES
 from glm2api.glm.translator import (
     convert_messages_to_glm_prompt,
     extract_text_content,
@@ -218,12 +218,12 @@ def test_accumulator_does_not_emit_partial_tool_call_when_budget_is_exhausted():
                     "logic_id": "1",
                     "content": [
                         {
-                            "type": "tool_calls",
-                            "tool_calls": {
-                                "id": "call_bash",
-                                "name": "Bash",
-                                "arguments": '{"command":"pwd"}',
-                            },
+                            "type": "text",
+                            "text": (
+                                '<|DSML|tool_calls><|DSML|invoke name="Bash">'
+                                '<|DSML|parameter name="command">pwd</|DSML|parameter>'
+                                '</|DSML|invoke></|DSML|tool_calls>'
+                            ),
                         }
                     ],
                 }
@@ -276,12 +276,12 @@ def test_length_limit_does_not_allow_a_different_forced_tool():
                     "logic_id": "1",
                     "content": [
                         {
-                            "type": "tool_calls",
-                            "tool_calls": {
-                                "id": "call_read",
-                                "name": "Read",
-                                "arguments": '{"file_path":"README.md"}',
-                            },
+                            "type": "text",
+                            "text": (
+                                '<|DSML|tool_calls><|DSML|invoke name="Read">'
+                                '<|DSML|parameter name="file_path">README.md</|DSML|parameter>'
+                                '</|DSML|invoke></|DSML|tool_calls>'
+                            ),
                         }
                     ],
                 }
@@ -323,15 +323,12 @@ def test_tool_call_budget_ignores_suppressed_preface_in_stream_and_response():
                 "content": [
                     {
                         "type": "text",
-                        "text": "I will run the requested command. " * 4,
-                    },
-                    {
-                        "type": "tool_calls",
-                        "tool_calls": {
-                            "id": "call_bash",
-                            "name": "Bash",
-                            "arguments": '{"command":"pwd"}',
-                        },
+                        "text": (
+                            "I will run the requested command. " * 4
+                            + '<|DSML|tool_calls><|DSML|invoke name="Bash">'
+                            + '<|DSML|parameter name="command">pwd</|DSML|parameter>'
+                            + '</|DSML|invoke></|DSML|tool_calls>'
+                        ),
                     },
                 ],
             }
@@ -340,12 +337,12 @@ def test_tool_call_budget_ignores_suppressed_preface_in_stream_and_response():
     streaming = GLMUpstreamEventAccumulator(
         model="glm-test",
         allowed_tool_names={"Bash"},
-        max_output_tokens=120,
+        max_output_tokens=140,
     )
     non_streaming = GLMUpstreamEventAccumulator(
         model="glm-test",
         allowed_tool_names={"Bash"},
-        max_output_tokens=120,
+        max_output_tokens=140,
     )
     streaming.consume_event(payload)
     non_streaming.consume_event(payload)
@@ -400,7 +397,14 @@ def test_convert_messages_to_glm_prompt_injects_xml_tool_prompt_and_history():
     assert "Parameter names are case-sensitive and must exactly match the schema." in prompt
     assert "never change it to `filepath`, `file_path`, or `FilePath`." in prompt
     assert "# BLOCKED TOOLS" not in prompt
-    assert "Ignore any tool names that are not listed below" in prompt
+    assert "Ignore client tool names that are not listed below" in prompt
+    assert "client-executed tools declared for this turn" in prompt
+    assert "Never substitute a remote sandbox result" in prompt
+    assert prompt.index("# CONVERSATION") < prompt.index("User: 查天气")
+    assert prompt.index("<|DSML|tool_result") < prompt.index("# TOOL SCHEMAS")
+    assert prompt.index("# TOOL SCHEMAS") < prompt.index("# TOOL USE PROTOCOL")
+    assert prompt.index("# TOOL USE PROTOCOL") < prompt.rindex("Assistant:")
+    assert prompt.rstrip().endswith("Assistant:")
 
 
 def test_convert_messages_to_glm_prompt_rejects_orphan_and_duplicate_tool_results():
@@ -768,23 +772,24 @@ def test_accumulator_enforces_tool_choice_for_text_and_streaming_results():
         required_accumulator.finalize(status="finish")
 
 
-def test_convert_messages_to_glm_prompt_filters_native_url_tools_and_reinforces_tool_awareness():
+def test_convert_messages_to_glm_prompt_preserves_dynamic_tool_names_and_explicit_blocks():
     converted = convert_messages_to_glm_prompt(
         messages=[Message(role="user", content="打开 https://example.com")],
         tools=[
             _tool("open_url", "Open URL", {"type": "object"}),
             _tool("mcp__CherryFetch__fetchJson", "Fetch JSON", {"type": "object"}),
+            _tool("blocked_by_admin", "Blocked", {"type": "object"}),
         ],
-        blocked_tool_names=BLOCKED_NATIVE_TOOL_NAMES,
+        blocked_tool_names={"blocked_by_admin"},
     )
 
     prompt = converted[0]["content"][0]["text"]
 
-    assert "Tool: open_url" not in prompt
+    assert "Tool: open_url" in prompt
+    assert "Tool: blocked_by_admin" not in prompt
     assert "Server-side native tools" not in prompt
     assert "Tool: mcp__CherryFetch__fetchJson" in prompt
-    assert "You do not have hidden browser, web, or URL-opening tools." in prompt
-    assert "Never call native tools such as `open_url`" in prompt
+    assert "provider-managed web or sandbox tools" in prompt
     assert "Do not output hidden reasoning, chain-of-thought, or labels such as `Thinking:`." in prompt
     assert "Do not narrate tool selection, failed tool attempts, retries, fallback plans, or tool status banners." in prompt
     assert "Never output tool-call display text such as `⚙ tool_name [...]`" in prompt
@@ -898,8 +903,12 @@ def test_accumulator_repairs_param_name_only_tool_call_with_fallback_url():
     )
 
 
-def test_accumulator_ignores_unallowed_native_tool_call_blocks():
-    accumulator = GLMUpstreamEventAccumulator(model="glm-test", allowed_tool_names={"get_weather"})
+@pytest.mark.parametrize("allowed_tool_names", [{"get_weather"}, {"open_url"}])
+def test_accumulator_keeps_structured_provider_tool_calls_internal(allowed_tool_names):
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names=allowed_tool_names,
+    )
     accumulator.consume_event(
         {
             "conversation_id": "conv_1",
@@ -927,6 +936,88 @@ def test_accumulator_ignores_unallowed_native_tool_call_blocks():
 
     assert payload["choices"][0]["finish_reason"] == "stop"
     assert "tool_calls" not in message
+    assert accumulator.provider_tool_names == frozenset({"open_url"})
+
+
+def test_accumulator_keeps_provider_tool_call_internal_even_when_name_is_declared():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"open_url"},
+    )
+    accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "tool_calls",
+                            "tool_calls": {
+                                "id": "call_open_url",
+                                "name": "open_url",
+                                "arguments": '{"urls":["https://example.com"]}',
+                            },
+                        }
+                    ],
+                    "meta_data": {"show_type": "mc_tool_call2"},
+                }
+            ],
+        }
+    )
+
+    response = accumulator.build_response()
+
+    assert response.message.tool_calls == ()
+    assert accumulator.provider_tool_names == frozenset({"open_url"})
+
+
+def test_accumulator_records_provider_tool_metadata_once():
+    messages = []
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"terminal"},
+        logger=SimpleNamespace(info=lambda message, *args: messages.append(message % args)),
+    )
+    event = {
+        "parts": [
+            {
+                "logic_id": "1",
+                "content": [{"type": "think", "think": "checking"}],
+                "meta_data": {
+                    "tool_result_extra": {"tool_call_name": "execute_sandbox_code"}
+                },
+            }
+        ]
+    }
+
+    accumulator.consume_event(event)
+    accumulator.consume_event(event)
+
+    assert accumulator.provider_tool_names == frozenset({"execute_sandbox_code"})
+    assert accumulator.remote_sandbox_used is True
+    assert len(messages) == 1
+
+
+def test_accumulator_does_not_infer_private_tool_use_from_python_answer_type():
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names={"execute_code"},
+    )
+
+    accumulator.consume_event(
+        {
+            "meta_data": {"answer_type": "python"},
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [{"type": "text", "text": "print('hello')"}],
+                }
+            ],
+        }
+    )
+
+    assert not accumulator.provider_tool_names
 
 
 def test_accumulator_does_not_expose_native_tools_without_declarations():
@@ -955,6 +1046,34 @@ def test_accumulator_does_not_expose_native_tools_without_declarations():
     message = _openai_payload(accumulator.build_response())["choices"][0]["message"]
 
     assert "tool_calls" not in message
+
+
+def test_accumulator_does_not_expose_dsml_tools_without_declarations():
+    accumulator = GLMUpstreamEventAccumulator(model="glm-test")
+    accumulator.consume_event(
+        {
+            "conversation_id": "conv_1",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                '<|DSML|tool_calls><|DSML|invoke name="terminal">'
+                                '<|DSML|parameter name="command">pwd</|DSML|parameter>'
+                                '</|DSML|invoke></|DSML|tool_calls>'
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    response = accumulator.build_response()
+
+    assert response.message.tool_calls == ()
 
 
 def test_accumulator_keeps_markdown_block_separators_between_parts():
