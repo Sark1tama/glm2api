@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Application code lives in `src/glm2api/`. HTTP startup and routing are handled by `app.py`, `server.py`, and `__main__.py`; configuration and logging have dedicated modules. Protocol translation and upstream integration belong under `src/glm2api/services/`, while reusable parsing helpers live in `src/glm2api/utils/`. Keep the root `main.py` as a thin launcher. Tests are in `tests/` and generally mirror a capability, such as `test_translator.py` or `test_video.py`. Runtime state belongs in `data/`; protocol notes belong in `docs/`.
+Application code lives in `src/glm2api/`, layered as: `api/` for HTTP routing, error mapping, and SSE writing, with public-protocol adapters in `api/adapters/` (`openai/`, `anthropic/`); `core/` for protocol-neutral request/result/stream objects, usage tracking, and the local output token budget; `glm/` for the upstream ChatGLM implementation (client, auth, chat, translator, events, file upload, and the DSML tool bridge in `glm/tools/`); `media/` for the independent image and video vertical slices; `infrastructure/` for logging. Generic JSON helpers live in `src/glm2api/utils/`. Startup is wired by `app.py` and `__main__.py`; keep the root `main.py` as a thin launcher. Tests are in `tests/` and generally mirror a capability, such as `test_glm_translator.py`, `test_protocol_adapters.py`, or `test_video.py`. Runtime state belongs in `data/`; protocol notes belong in `docs/`.
 
 ## Build, Test, and Development Commands
 
@@ -16,7 +16,7 @@ After startup, verify the service with `curl http://127.0.0.1:8000/health`.
 
 ## Coding Style & Naming Conventions
 
-Use four-space indentation and standard Python conventions: `snake_case` for modules, functions, and variables; `PascalCase` for classes; and `UPPER_SNAKE_CASE` for constants. Prefer type hints on public boundaries and small, focused adapters over cross-module abstractions. Match the existing import grouping and keep protocol-specific logic in the relevant service module. No formatter or linter is currently configured, so avoid unrelated formatting churn.
+Use four-space indentation and standard Python conventions: `snake_case` for modules, functions, and variables; `PascalCase` for classes; and `UPPER_SNAKE_CASE` for constants. Prefer type hints on public boundaries and small, focused adapters over cross-module abstractions. Match the existing import grouping and keep protocol-specific logic in the relevant adapter or `glm` module. No formatter or linter is currently configured, so avoid unrelated formatting churn.
 
 ## Testing Guidelines
 

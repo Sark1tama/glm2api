@@ -160,10 +160,12 @@ ChatGLM 网页协议没有通用的 `temperature`、`top_p`、停止序列或结
 
 ```text
 src/glm2api/
+├── {app,__main__}.py                 应用装配和启动入口
 ├── api/server.py                     HTTP 路由和响应写回
 ├── api/{errors,sse}.py               错误映射和 SSE 写出
 ├── api/adapters/                     文本公共协议边界转换
 ├── core/models.py                    内部请求、结果和流事件
+├── core/output_budget.py             本地输出 token 预算
 ├── core/usage.py                     usage 来源追踪和保守估算
 ├── glm/tools/{dsml,parser}.py        GLM 工具协议序列化和解析
 ├── glm/{chat,translator,events}.py   GLM 模型映射、prompt 和 SSE 事件
