@@ -39,14 +39,13 @@ def test_networking_is_controlled_only_by_explicit_request_capability():
 
 
 def test_chat_mode_is_controlled_only_by_explicit_request_capabilities():
-    assert resolve_chat_mode(None, None) == ""
-    assert resolve_chat_mode("none", None) == ""
-    assert resolve_chat_mode("low", None) == ""
-    assert resolve_chat_mode("medium", None) == "thinking"
-    assert resolve_chat_mode("high", None) == "deep_thinking"
-    assert resolve_chat_mode("xhigh", None) == "deep_thinking"
-    assert resolve_chat_mode("max", None) == "deep_thinking"
-    assert resolve_chat_mode(None, True) == "deep_thinking"
+    assert resolve_chat_mode(None) == ""
+    assert resolve_chat_mode("none") == ""
+    assert resolve_chat_mode("low") == ""
+    assert resolve_chat_mode("medium") == "thinking"
+    assert resolve_chat_mode("high") == "deep_thinking"
+    assert resolve_chat_mode("xhigh") == "deep_thinking"
+    assert resolve_chat_mode("max") == "deep_thinking"
 
 
 def test_current_models_are_exposed_without_virtual_variants():

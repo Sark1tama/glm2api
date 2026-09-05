@@ -143,8 +143,6 @@ def request_to_glm_payload(request: TextGenerationRequest) -> dict[str, object]:
         result["reasoning_effort"] = request.reasoning_effort
     if request.web_search:
         result["web_search"] = True
-    if request.deep_research:
-        result["deep_research"] = True
     return result
 
 
@@ -385,7 +383,6 @@ def convert_messages_to_glm_prompt(
             if tool_call_id in consumed_tool_result_ids:
                 raise ValueError(f"tool_result 的 tool_call_id 重复: {tool_call_id}")
             consumed_tool_result_ids.add(tool_call_id)
-            role = "user"
             history_tool_name = tool_names_by_call_id[tool_call_id]
             explicit_tool_name = str(message.get("name", "")).strip()
             if explicit_tool_name and explicit_tool_name != history_tool_name:
@@ -425,6 +422,7 @@ def convert_messages_to_glm_prompt(
             .replace("assistant", "Assistant")
             .replace("user", "User")
             .replace("developer", "Developer")
+            .replace("tool", "Tool")
         )
         transcript_parts.append(f"{title}: {item['content']}".strip())
 

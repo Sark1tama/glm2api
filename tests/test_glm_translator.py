@@ -496,6 +496,8 @@ def test_convert_messages_to_glm_prompt_injects_xml_tool_prompt_and_history():
     assert "If the user explicitly requests a listed client-side tool" in prompt
     assert "Do not substitute one execution environment for another." in prompt
     assert prompt.index("# CONVERSATION") < prompt.index("User: 查天气")
+    assert 'Tool: <|DSML|tool_result call_id="call_1" name="get_weather">' in prompt
+    assert 'User: <|DSML|tool_result call_id="call_1"' not in prompt
     assert prompt.index("<|DSML|tool_result") < prompt.index("# TOOL SCHEMAS")
     assert prompt.index("# TOOL SCHEMAS") < prompt.index("# TOOL USE PROTOCOL")
     assert prompt.index("# TOOL USE PROTOCOL") < prompt.rindex("Assistant:")

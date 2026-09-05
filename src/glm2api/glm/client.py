@@ -651,10 +651,7 @@ class GLMWebClient:
             )
         )
 
-        chat_mode = resolve_chat_mode(
-            reasoning_effort=request.reasoning_effort,
-            deep_research=request.deep_research,
-        )
+        chat_mode = resolve_chat_mode(request.reasoning_effort)
         is_networking = resolve_networking(
             web_search=request.web_search,
         )

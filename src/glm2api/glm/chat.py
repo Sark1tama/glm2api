@@ -48,9 +48,7 @@ def validate_text_model(model: str) -> str:
     return requested_model
 
 
-def resolve_chat_mode(reasoning_effort: object, deep_research: object) -> str:
-    if deep_research:
-        return "deep_thinking"
+def resolve_chat_mode(reasoning_effort: object) -> str:
     if reasoning_effort is not None:
         normalized_effort = str(reasoning_effort).strip().lower().replace("-", "_")
         if normalized_effort in REASONING_EFFORT_CHAT_MODES:

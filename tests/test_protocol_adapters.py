@@ -96,6 +96,30 @@ def test_openai_responses_to_internal_preserves_tool_choice():
     assert converted.tool_choice.name == "get_weather"
 
 
+def test_openai_responses_to_internal_enables_standard_web_search_tool():
+    converted = openai_responses_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "input": "联网查询",
+            "tools": [{"type": "web_search"}],
+        }
+    )
+
+    assert converted.web_search is True
+
+
+def test_openai_chat_completions_ignores_nonstandard_web_search_flag():
+    converted = openai_chat_completions_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "联网查询"}],
+            "web_search": True,
+        }
+    )
+
+    assert converted.web_search is False
+
+
 def test_openai_responses_to_internal_preserves_reasoning_input_item():
     converted = openai_responses_to_internal(
         {
@@ -1346,6 +1370,20 @@ def test_anthropic_messages_to_internal_rejects_unsupported_server_tool():
                 "tools": [{"type": "computer_20250124", "name": "computer"}],
             }
         )
+
+
+def test_anthropic_messages_to_internal_enables_standard_web_search_tool():
+    converted = anthropic_messages_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "联网查询"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"}
+            ],
+        }
+    )
+
+    assert converted.web_search is True
 
 
 def test_output_adapters_accept_internal_text_response():

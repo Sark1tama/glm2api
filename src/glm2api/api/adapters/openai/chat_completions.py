@@ -316,7 +316,7 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
 
     structured_output = _response_format_from_openai(payload.get("response_format"))
 
-    for field_name in ("stream", "web_search", "deep_research"):
+    for field_name in ("stream",):
         if field_name in payload and not isinstance(payload[field_name], bool):
             raise ValueError(f"OpenAI {field_name} 必须是布尔值")
     max_tokens = payload.get("max_tokens")
@@ -351,8 +351,6 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
         "tool_choice",
         "response_format",
         "reasoning_effort",
-        "web_search",
-        "deep_research",
     }
     extra = {key: value for key, value in payload.items() if key not in known_fields}
     return TextGenerationRequest(
@@ -367,8 +365,6 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
         tool_choice=tool_choice_from_openai(payload.get("tool_choice")),
         structured_output=structured_output,
         reasoning_effort=reasoning_effort,
-        web_search=bool(payload.get("web_search", False)),
-        deep_research=bool(payload.get("deep_research", False)),
         extra=extra,
     )
 

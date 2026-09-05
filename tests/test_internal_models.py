@@ -140,8 +140,6 @@ def test_text_request_round_trips_without_openai_objects_inside():
         ],
         "tool_choice": {"type": "function", "function": {"name": "weather"}},
         "reasoning_effort": "high",
-        "web_search": True,
-        "deep_research": True,
     }
 
     request = openai_chat_completions_to_internal(payload)
