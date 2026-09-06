@@ -1,6 +1,9 @@
 # glm2api
 
-`glm2api` 是一个本地协议代理：它把 ChatGLM 网页端的私有接口转换成可供常用客户端使用的兼容 API。项目面向本地部署，主线支持 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages；图片、视频属于次级兼容能力。
+`glm2api` 是一个本地协议代理：它把 ChatGLM 网页端接口转换成可供常用客户端使用的兼容 API。项目面向本地部署，主线支持 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages；图片、视频属于次级兼容能力。
+
+> [!IMPORTANT]
+> 本项目仅供学习交流与个人研究使用，与上游服务提供方无关联。请自行确保使用行为符合相关服务的条款与当地法律法规，使用风险由使用者自行承担。
 
 ## 功能概览
 
@@ -9,10 +12,10 @@
 - 图片（次级）：`/v1/images/generations`
 - 视频（次级）：`/v1/videos`、视频查询和 `/content` 下载
 - 模型列表：`/v1/models`
-- 多账号轮换、游客模式、请求队列和上游失败重试
-- 工具调用、图片/文件输入和保守的 token usage 估算
+- 请求队列、上游失败重试和保守的 token usage 估算
+- 工具调用、图片/文件输入
 
-上游是 ChatGLM 网页端的私有协议；接口字段或行为变化时，需要同步调整兼容层并重新验证。
+上游是 ChatGLM 网页端协议，非官方开放 API；接口字段或行为变化时，需要同步调整兼容层并重新验证。
 
 ## 快速开始
 
@@ -26,13 +29,13 @@ uv sync
 uv run python main.py
 ```
 
-将登录 ChatGLM 后取得的 `refresh_token` 写入 `.env`：
+在 `.env` 中配置你本人账号的 `refresh_token`：
 
 ```env
 GLM_REFRESH_TOKEN=你的_refresh_token
 ```
 
-也可以不登录而使用游客模式：
+也可以使用游客模式（无需配置账号）：
 
 ```env
 GLM_USE_GUEST_REFRESH_TOKEN=true
@@ -183,11 +186,5 @@ uv build                      # 构建发行包
 ```
 
 测试不需要真实 token 或网络，应使用 mock 上游响应。
-
-## 安全提示
-
-不要提交 `.env`、`token.txt`、refresh token、API key 或调试日志。`DEBUG_DUMP_ALL=true` 会记录完整请求和响应，可能包含敏感内容；仅在本地排查问题时短暂开启。
-
-远程图片/文档引用只接受公网 HTTP(S)，data URL 必须是 base64 且不超过 100 MiB；HTTP 请求体默认上限为 101 MiB（可用 `MAX_REQUEST_BODY_BYTES` 调整）。调试日志会脱敏常见认证字段，但仍不应在生产环境长期开启完整 payload 记录。
 
 项目许可证见 [`LICENSE`](LICENSE)。
