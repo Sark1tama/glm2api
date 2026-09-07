@@ -21,6 +21,7 @@ from .tools.dsml import (
     serialize_tool_result_block,
     tools_to_prompt,
 )
+from .tools.names import ClientToolNameMap
 from ..utils.json import safe_json_dumps
 
 URL_PATTERN = re.compile(r"https?://[^\s<>()\"']+")
@@ -258,6 +259,7 @@ def sanitize_tool_call_payload(
 def sanitize_tool_calls(
     tool_calls: list[dict[str, object]],
     fallback_url: str | None = None,
+    tool_name_map: ClientToolNameMap | None = None,
 ) -> list[dict[str, object]]:
     sanitized: list[dict[str, object]] = []
     for index, tool_call in enumerate(tool_calls):
@@ -267,6 +269,11 @@ def sanitize_tool_calls(
         tool_name = str(function.get("name", "")).strip()
         if not tool_name:
             continue
+        sanitization_name = (
+            tool_name_map.original_for(tool_name)
+            if tool_name_map is not None
+            else tool_name
+        )
         original_arguments = function.get("arguments", "{}")
         original_value: object = original_arguments
         if isinstance(original_arguments, str):
@@ -275,7 +282,7 @@ def sanitize_tool_calls(
             except json.JSONDecodeError:
                 original_value = original_arguments
         cleaned_arguments = sanitize_tool_call_payload(
-            tool_name=tool_name,
+            tool_name=sanitization_name,
             arguments=original_arguments,
             fallback_url=fallback_url,
         )
@@ -317,17 +324,34 @@ def convert_messages_to_glm_prompt(
     blocked_tool_names: set[str] | None = None,
     tool_choice: ToolChoice | None = None,
     structured_output: StructuredOutputConfig | None = None,
+    tool_name_map: ClientToolNameMap | None = None,
 ) -> list[dict[str, object]]:
+    tool_name_map = tool_name_map or ClientToolNameMap.from_tools(tools)
     chat_messages = messages_to_glm_payload(messages)
     chat_tools = [tool_definition_to_glm_payload(tool) for tool in (tools or [])]
     filtered_tools = filter_tools(chat_tools, blocked_tool_names or set())
+    aliased_tools: list[dict[str, object]] = []
+    for tool in filtered_tools or []:
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        aliased_function = dict(function)
+        aliased_function["name"] = tool_name_map.alias_for(str(function.get("name", "")))
+        aliased_tool = dict(tool)
+        aliased_tool["function"] = aliased_function
+        aliased_tools.append(aliased_tool)
+    # Apply the private namespace only after blocked tools have been removed.
+    filtered_tools = aliased_tools
     available_tool_names = {
         str(tool.get("function", {}).get("name", "")).strip()
         for tool in (filtered_tools or [])
         if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
     }
     available_tool_names.discard("")
-    tool_choice_policy = parse_tool_choice_policy(tool_choice, available_tool_names)
+    tool_choice_policy = parse_tool_choice_policy(
+        tool_name_map.alias_tool_choice(tool_choice),
+        available_tool_names,
+    )
     processed: list[dict[str, str]] = []
     latest_user_url: str | None = extract_recent_user_url(chat_messages)
     tool_names_by_call_id: dict[str, str] = {}
@@ -351,11 +375,12 @@ def convert_messages_to_glm_prompt(
             for tool_call in sanitized_tool_calls:
                 function = tool_call.get("function", {})
                 tool_name = str(function.get("name", "unknown"))
-                if available_tool_names and tool_name not in available_tool_names:
+                upstream_tool_name = tool_name_map.alias_for(tool_name)
+                if available_tool_names and upstream_tool_name not in available_tool_names:
                     continue
                 tool_blocks.append(
                     serialize_tool_call_block(
-                        name=tool_name,
+                        name=upstream_tool_name,
                         arguments=function.get("arguments", "{}"),
                     )
                 )
@@ -394,7 +419,7 @@ def convert_messages_to_glm_prompt(
             tool_result_text = extract_text_content(content)
             content = serialize_tool_result_block(
                 tool_call_id=tool_call_id or message.get("tool_call_id", "unknown"),
-                tool_name=tool_name,
+                tool_name=tool_name_map.alias_for(tool_name),
                 content=tool_result_text,
             )
         elif role == "assistant" and not content:
@@ -410,7 +435,7 @@ def convert_messages_to_glm_prompt(
     if filtered_tools and tool_choice_policy.get("mode") != "none":
         tool_prompt = tools_to_prompt(
             filtered_tools,
-            blocked_tool_names=blocked_tool_names,
+            blocked_tool_names=None,
             tool_choice_policy=tool_choice_policy,
         )
         transcript_parts.append("# CONVERSATION")

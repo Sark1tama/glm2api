@@ -119,6 +119,7 @@ def build_tool_call_instructions(
             [
                 "",
                 f"Client-side DSML tools: {available_xml_names}.",
+                "Tool names are exact wire names, including any `client__` prefix; never remove or rewrite that prefix.",
                 "Only these names may be emitted as DSML tools. Use the exact parameter fields from their schemas.",
                 "A client tool call must be one executable DSML block in the final assistant text. Do not mix it with prose or another tool-call syntax.",
                 "Use the DSML format below exactly.",

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from glm2api.glm.events import GLMUpstreamEventAccumulator
+from glm2api.glm.tools.names import ClientToolNameMap
 from glm2api.glm.translator import (
     convert_messages_to_glm_prompt,
     extract_text_content,
@@ -478,8 +479,8 @@ def test_convert_messages_to_glm_prompt_injects_xml_tool_prompt_and_history():
     prompt = converted[0]["content"][0]["text"]
 
     assert "<|DSML|tool_calls>" in prompt
-    assert "<|DSML|invoke name=\"get_weather\">" in prompt
-    assert "<|DSML|tool_result call_id=\"call_1\" name=\"get_weather\">" in prompt
+    assert "<|DSML|invoke name=\"client__get_weather\">" in prompt
+    assert "<|DSML|tool_result call_id=\"call_1\" name=\"client__get_weather\">" in prompt
     assert "<ml_tool_calls>" not in prompt
     assert "# TOOL USE PROTOCOL" in prompt
     assert "Use the DSML format below exactly." in prompt
@@ -496,7 +497,7 @@ def test_convert_messages_to_glm_prompt_injects_xml_tool_prompt_and_history():
     assert "If the user explicitly requests a listed client-side tool" in prompt
     assert "Do not substitute one execution environment for another." in prompt
     assert prompt.index("# CONVERSATION") < prompt.index("User: 查天气")
-    assert 'Tool: <|DSML|tool_result call_id="call_1" name="get_weather">' in prompt
+    assert 'Tool: <|DSML|tool_result call_id="call_1" name="client__get_weather">' in prompt
     assert 'User: <|DSML|tool_result call_id="call_1"' not in prompt
     assert prompt.index("<|DSML|tool_result") < prompt.index("# TOOL SCHEMAS")
     assert prompt.index("# TOOL SCHEMAS") < prompt.index("# TOOL USE PROTOCOL")
@@ -554,7 +555,7 @@ def test_convert_messages_to_glm_prompt_recovers_tool_result_name_from_history()
 
     prompt = converted[0]["content"][0]["text"]
 
-    assert '<|DSML|tool_result call_id="call_1" name="Bash">' in prompt
+    assert '<|DSML|tool_result call_id="call_1" name="client__Bash">' in prompt
     assert "unknown_tool" not in prompt
 
 
@@ -642,6 +643,94 @@ def test_accumulator_build_response_maps_xml_to_openai_tool_calls():
     assert message["content"] is None
     assert message["tool_calls"][0]["function"]["name"] == "get_weather"
     assert message["tool_calls"][0]["function"]["arguments"] == '{"city":"上海"}'
+
+
+def test_client_tool_aliases_are_private_upstream_names_and_restore_in_response():
+    tool_name_map = ClientToolNameMap.from_tools([_tool("web_search")])
+    alias = tool_name_map.alias_for("web_search")
+    converted = convert_messages_to_glm_prompt(
+        messages=[Message(role="user", content="搜索")],
+        tools=[_tool("web_search")],
+        tool_choice=ToolChoice(mode="function", name="web_search"),
+        tool_name_map=tool_name_map,
+    )
+    prompt = converted[0]["content"][0]["text"]
+
+    assert alias == "client__web_search"
+    assert f"Tool: {alias}" in prompt
+    assert f"`{alias}`" in prompt
+    assert "Tool: web_search" not in prompt
+    assert f"`{alias}` through DSML" in prompt
+    assert "including any `client__` prefix" in prompt
+
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names=set(tool_name_map.aliases),
+        tool_choice=tool_name_map.alias_tool_choice(
+            ToolChoice(mode="function", name="web_search")
+        ),
+        tool_name_map=tool_name_map,
+    )
+    accumulator.consume_event(
+        {
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f'<|DSML|tool_calls><|DSML|invoke name="{alias}">'
+                                '<|DSML|parameter name="query"><![CDATA[GLM]]>'
+                                f"</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    events = accumulator.finalize(status="finish")
+    response = accumulator.build_response()
+
+    assert [event.tool_call.name for event in events if event.kind == "tool_call_delta"] == ["web_search"]
+    assert [call.name for call in response.message.tool_calls] == ["web_search"]
+
+
+def test_client_tool_alias_preserves_shell_argument_repair():
+    tool_name_map = ClientToolNameMap.from_tools([_tool("shell")])
+    alias = tool_name_map.alias_for("shell")
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-test",
+        allowed_tool_names=set(tool_name_map.aliases),
+        tool_name_map=tool_name_map,
+    )
+    accumulator.consume_event(
+        {
+            "status": "finish",
+            "parts": [
+                {
+                    "logic_id": "1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f'<|DSML|tool_calls><|DSML|invoke name="{alias}">'
+                                '<|DSML|parameter name="command"><![CDATA[Get-ChildItem]]>'
+                                f"</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    response = accumulator.build_response()
+
+    assert response.message.tool_calls[0].name == "shell"
+    assert '"powershell.exe"' in response.message.tool_calls[0].arguments
 
 
 def test_accumulator_streaming_tool_call_emits_assistant_role_before_tool_delta():
@@ -936,7 +1025,7 @@ def test_convert_messages_to_glm_prompt_respects_tool_choice_none_and_specific()
         tool_choice=ToolChoice(mode="function", name="get_weather"),
     )
     specific_prompt = specific_converted[0]["content"][0]["text"]
-    assert "call exactly the client-side tool `get_weather` through DSML" in specific_prompt
+    assert "call exactly the client-side tool `client__get_weather` through DSML" in specific_prompt
 
 
 def test_accumulator_enforces_tool_choice_for_text_and_streaming_results():
@@ -992,10 +1081,10 @@ def test_convert_messages_to_glm_prompt_preserves_dynamic_tool_names_and_explici
 
     prompt = converted[0]["content"][0]["text"]
 
-    assert "Tool: open_url" in prompt
+    assert "Tool: client__open_url" in prompt
     assert "Tool: blocked_by_admin" not in prompt
     assert "Server-side native tools" not in prompt
-    assert "Tool: mcp__CherryFetch__fetchJson" in prompt
+    assert "Tool: client__mcp__CherryFetch__fetchJson" in prompt
     assert "Provider-side tools run inside ChatGLM's remote environment" in prompt
     assert "A tool name emitted through DSML always refers to the listed client-side tool" in prompt
     assert "Do not emit undeclared names as DSML tools." in prompt
@@ -1023,7 +1112,7 @@ def test_convert_messages_to_glm_prompt_drops_blocked_tool_call_history():
     prompt = converted[0]["content"][0]["text"]
 
     assert "name=\"open_url\"" not in prompt
-    assert "Tool: mcp__CherryFetch__fetchJson" in prompt
+    assert "Tool: client__mcp__CherryFetch__fetchJson" in prompt
 
 
 def test_convert_messages_to_glm_prompt_repairs_cherry_fetch_url_and_skips_invalid_tool_error_history():

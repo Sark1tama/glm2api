@@ -101,7 +101,7 @@ def _successful_tool_event():
                     {
                         "type": "text",
                         "text": (
-                            '<|DSML|tool_calls><|DSML|invoke name="terminal">'
+                            '<|DSML|tool_calls><|DSML|invoke name="client__terminal">'
                             '<|DSML|parameter name="command"><![CDATA[uname -a]]>'
                             '</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>'
                         ),

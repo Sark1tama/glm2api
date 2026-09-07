@@ -34,6 +34,7 @@ from .chat import (
 )
 from .errors import QueueTimeoutError, UpstreamAPIError
 from .events import GLMUpstreamEventAccumulator, effective_event_status, is_nonzero_status
+from .tools.names import ClientToolNameMap
 from .translator import convert_messages_to_glm_prompt, extract_recent_user_url, messages_to_glm_payload
 
 
@@ -224,7 +225,9 @@ class GLMWebClient:
         self,
         request: TextGenerationRequest,
     ) -> tuple[TextGenerationResponse, str | None]:
-        _, allowed_tool_names = self._resolve_tools(request)
+        filtered_tools, _ = self._resolve_tools(request)
+        tool_name_map = ClientToolNameMap.from_tools(filtered_tools)
+        allowed_tool_names = set(tool_name_map.aliases)
         lease = self.request_queue.acquire(f"chat:{request.model}")
         preferred_account_index = self.get_preferred_account_index(lease.ticket)
         attempt_request = request
@@ -239,6 +242,7 @@ class GLMWebClient:
                     attempt_request,
                     allowed_tool_names,
                     usage,
+                    tool_name_map=tool_name_map,
                 )
                 try:
                     for event in self.iter_sse_events(response):
@@ -281,7 +285,9 @@ class GLMWebClient:
     ) -> Iterator[TextStreamEvent]:
         """Yield protocol-neutral text stream events."""
         request.stream = True
-        _, allowed_tool_names = self._resolve_tools(request)
+        filtered_tools, _ = self._resolve_tools(request)
+        tool_name_map = ClientToolNameMap.from_tools(filtered_tools)
+        allowed_tool_names = set(tool_name_map.aliases)
         lease = self.request_queue.acquire(f"stream:{request.model}")
         preferred_account_index = self.get_preferred_account_index(lease.ticket)
         try:
@@ -307,6 +313,7 @@ class GLMWebClient:
                         attempt_request,
                         allowed_tool_names,
                         current_usage,
+                        tool_name_map=tool_name_map,
                     )
                     buffered_events: list[TextStreamEvent] | None = [] if allowed_tool_names else None
                     completion_status = "stop"
@@ -386,11 +393,18 @@ class GLMWebClient:
         request: TextGenerationRequest,
         allowed_tool_names: set[str],
         usage: TokenUsage,
+        tool_name_map: ClientToolNameMap | None = None,
     ) -> GLMUpstreamEventAccumulator:
+        internal_tool_choice = (
+            tool_name_map.alias_tool_choice(request.tool_choice)
+            if tool_name_map is not None
+            else request.tool_choice
+        )
         return GLMUpstreamEventAccumulator(
             model=request.model,
             allowed_tool_names=allowed_tool_names,
-            tool_choice=request.tool_choice,
+            tool_choice=internal_tool_choice,
+            tool_name_map=tool_name_map,
             fallback_tool_url=extract_recent_user_url(
                 messages_to_glm_payload(request.messages)
             ),
@@ -630,12 +644,14 @@ class GLMWebClient:
         self._validate_model_content(request, requested_model, upstream_model)
         self._validate_generation_parameters(request)
         filtered_tools, _ = self._resolve_tools(request)
+        tool_name_map = ClientToolNameMap.from_tools(filtered_tools)
         converted_messages = convert_messages_to_glm_prompt(
             messages=request.messages,
             tools=filtered_tools,
             blocked_tool_names={name.strip() for name in self.config.blocked_tool_names if name.strip()},
             tool_choice=request.tool_choice,
             structured_output=request.structured_output,
+            tool_name_map=tool_name_map,
         )
         debug_dump(self.logger, self.config.debug_dump_all, "内部文本请求", request)
         debug_dump(self.logger, self.config.debug_dump_all, "转换后的 GLM messages", converted_messages)

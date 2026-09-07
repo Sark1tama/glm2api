@@ -13,6 +13,7 @@ from ..core.usage import TokenUsage, estimate_conservative_tokens
 from ..infrastructure.logging import debug_dump
 from ..utils.json import safe_json_dumps
 from .tools.parser import StreamingToolParser, parse_tool_calls_from_text
+from .tools.names import ClientToolNameMap
 from .translator import sanitize_tool_calls
 
 
@@ -135,6 +136,7 @@ class GLMUpstreamEventAccumulator:
     tool_choice: ToolChoice | None = None
     max_output_tokens: int | None = None
     stop_sequences: tuple[str, ...] = ()
+    tool_name_map: ClientToolNameMap | None = None
     _provider_tool_names: set[str] = field(default_factory=set)
     _output_budget: OutputTokenBudget = field(init=False, repr=False)
     _stop_filter: _StopSequenceFilter = field(init=False, repr=False)
@@ -177,7 +179,13 @@ class GLMUpstreamEventAccumulator:
             self._effective_full_text().strip(),
             allowed_tool_names=self.allowed_tool_names,
         )
-        return bool(sanitize_tool_calls(text_calls, fallback_url=self.fallback_tool_url))
+        return bool(
+            sanitize_tool_calls(
+                text_calls,
+                fallback_url=self.fallback_tool_url,
+                tool_name_map=self.tool_name_map,
+            )
+        )
 
     def usage_snapshot(self) -> TokenUsage:
         """Return usage observed so far for a discarded upstream attempt."""
@@ -417,7 +425,7 @@ class GLMUpstreamEventAccumulator:
                         tool_call=ToolCallDelta(
                             index=int(tool_call.get("index", 0)),
                             id=str(tool_call.get("id", "")) or None,
-                            name=tool_name,
+                            name=self._restore_tool_name(tool_name),
                             arguments=arguments,
                         ),
                     )
@@ -488,7 +496,7 @@ class GLMUpstreamEventAccumulator:
             internal_tool_calls.append(
                 ToolCall(
                     id=str(item.get("id") or f"call_repaired_{index}"),
-                    name=tool_name,
+                    name=self._restore_tool_name(tool_name),
                     arguments=arguments,
                 )
             )
@@ -529,6 +537,11 @@ class GLMUpstreamEventAccumulator:
         full_text, _ = self._render_full_output()
         return full_text or self.last_full_text
 
+    def _restore_tool_name(self, name: str) -> str:
+        if self.tool_name_map is None:
+            return name
+        return self.tool_name_map.original_for(name)
+
     def _collect_tool_calls(
         self,
         parsed_tool_calls: list[dict[str, object]],
@@ -537,6 +550,7 @@ class GLMUpstreamEventAccumulator:
         xml_tool_calls = sanitize_tool_calls(
             parsed_tool_calls,
             fallback_url=self.fallback_tool_url,
+            tool_name_map=self.tool_name_map,
         )
 
         all_tool_calls: list[dict[str, object]] = []
