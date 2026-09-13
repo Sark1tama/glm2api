@@ -13,7 +13,7 @@ def test_parse_tool_calls_from_dsml_markup():
 
     clean, tool_calls = parse_tool_calls_from_text(text, {"get_weather"})
 
-    assert clean == "before\n\nafter"
+    assert clean == "before"
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "get_weather"
     assert tool_calls[0]["function"]["arguments"] == '{"city":"上海","days":2}'
@@ -214,7 +214,7 @@ def test_parse_tool_calls_from_xml_markup():
 
     clean, tool_calls = parse_tool_calls_from_text(text, {"get_weather"})
 
-    assert clean == "开始\n\n结束"
+    assert clean == "开始"
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "get_weather"
     assert tool_calls[0]["function"]["arguments"] == '{"city":"上海","days":2}'
@@ -259,7 +259,7 @@ def test_streaming_tool_parser_hides_complete_tool_block():
     tail, tool_calls = parser.flush()
 
     assert first == "你好"
-    assert second == "世界"
+    assert second == ""
     assert tail == ""
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["arguments"] == '{"city":"上海"}'

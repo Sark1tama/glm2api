@@ -102,7 +102,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-流式请求只需增加 `"stream":true`。OpenAI Responses 和 Anthropic Messages 使用各自原生 JSON/SSE 格式；Responses 会把 GLM 推理作为独立的 `reasoning` output item 返回：
+流式请求只需增加 `"stream":true`。声明客户端工具时，推理和经工具解析器过滤后的正文也会增量发送；工具调用前的正文可以与工具调用共存，并共同计入输出预算；完整 DSML 工具块作为本轮交接点，其后正文不再返回，代理停止读取后续上游事件。沙箱替代重试仅在尚未发送内容时执行，已发送内容后遇到错误会直接失败收尾。OpenAI Responses 和 Anthropic Messages 使用各自原生 JSON/SSE 格式；Responses 会把 GLM 推理作为独立的 `reasoning` output item 返回。上游流式错误会按协议终止：Chat Completions 返回错误事件和 `[DONE]`，Responses 追加 `response.failed`，Anthropic 返回 `error` 事件后关闭流：
+
+Chat Completions 如需使用 GLM 远端联网，可显式传入代理扩展字段 `"web_search":true`，或在 `tools` 中声明 `type` 以 `web_search` 开头的工具；普通 `function` 工具（即使名称为 `web_search`）仍按客户端工具处理。
 
 ```python
 from openai import OpenAI
@@ -157,7 +159,11 @@ ChatGLM 网页协议没有通用的 `temperature`、`top_p`、停止序列或结
 
 ## 工具调用
 
-公共协议中的工具定义先进入内部工具对象，再由 GLM 文本桥接层构造成网页端可识别的 DSML。只有正文中的 DSML 会被解析回标准工具调用，隐藏推理中的示例或草稿不会执行。工具名称、参数名和 `tool_choice` 会在转换前校验；网页端内置的浏览器工具不会自动暴露给客户端。
+OpenAI 的 `parallel_tool_calls=false` 与 Anthropic 的 `tool_choice.disable_parallel_tool_use=true` 会限制每轮最多交付一个客户端工具调用：提示词要求串行调用，若模型仍生成多个调用，代理只返回第一个完整调用。停止序列仅匹配 DSML 解析后的正文，不匹配工具名称或参数。Responses 返回的工具定义、选择策略和并行设置来自本次内部请求。
+
+Responses 暂不保存可供 `previous_response_id` 引用的历史；传入非 null 的该字段会返回 400，请每轮在 `input` 中提供完整对话历史。
+
+公共协议中的工具定义先进入内部工具对象，再由 GLM 文本桥接层构造成网页端可识别的 DSML。客户端工具优先通过正文 DSML 解析；如果上游平台错误返回了本次请求声明的 `client__` 别名结构化调用，代理也会恢复为客户端工具调用。隐藏推理中的示例或草稿不会执行。工具名称、参数名和 `tool_choice` 会在转换前校验；网页端内置的浏览器工具不会自动暴露给客户端。
 
 ## 项目结构
 

@@ -113,6 +113,8 @@ def build_tool_call_instructions(
         "To call a client-side tool, emit its exact declared name and arguments using DSML.",
         "A tool name emitted through DSML always refers to the listed client-side tool, even when a provider-side tool has the same name.",
     ]
+    if policy.get("parallel_tool_calls") is False:
+        lines.append("Emit at most one client-side tool call this turn. Wait for its result before choosing the next tool.")
 
     if tool_names:
         lines.extend(
@@ -146,10 +148,11 @@ def build_tool_call_instructions(
             "- Provider-side web tools may be used for public internet resources.",
             "- Do not draft or hide a client tool call only in reasoning. When a client call is needed, emit its executable DSML block in the final assistant text.",
             "- Do not emit OpenAI JSON tool_calls arrays or function_call objects for client tools.",
-            "- Put multiple DSML invokes inside one <|DSML|tool_calls> root when you truly need multiple calls in one turn.",
             "- After a <|DSML|tool_result ...> block, continue from that result and call another tool only when necessary.",
         ]
     )
+    if policy.get("parallel_tool_calls") is not False:
+        lines.append("- Put multiple DSML invokes inside one <|DSML|tool_calls> root when you truly need multiple calls in one turn.")
     if mode == "none":
         lines.extend(
             [

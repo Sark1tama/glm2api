@@ -41,18 +41,13 @@ def write_responses_sse_error(
     logger: Logger,
     path: str,
 ) -> None:
-    """Write a Responses-specific error event using its accumulator envelope."""
-    event = accumulator.sse(
-        "error",
-        {
-            "type": "error",
-            "code": error_type,
-            "message": message,
-            "param": None,
-        },
-    )
+    """Write a Responses error and its terminal failed event."""
+    events = accumulator.fail(message, error_type)
+    if not events:
+        return
     try:
-        writer.write(event)
+        for event in events:
+            writer.write(event)
     except CLIENT_DISCONNECTED:
         logger.warning("客户端在 Responses SSE 错误写回前断开 path=%s", path)
 
@@ -268,6 +263,8 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
     """Convert an OpenAI Responses request body to the internal text model."""
     if not isinstance(payload, dict):
         raise ValueError("Responses 请求体顶层必须是对象")
+    if payload.get("previous_response_id") is not None:
+        raise ValueError("Responses previous_response_id 暂不支持；请在 input 中提供完整对话历史")
     messages: list[Message] = []
 
     # --- instructions -> system ---
@@ -426,7 +423,7 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
         temperature=temperature if isinstance(temperature, (int, float)) else None,
         top_p=top_p if isinstance(top_p, (int, float)) else None,
         tools=tuple(tool for tool in tools if tool.name),
-        tool_choice=tool_choice_from_openai(payload.get("tool_choice")),
+        tool_choice=tool_choice_from_openai(payload.get("tool_choice"), payload.get("parallel_tool_calls", True)),
         structured_output=structured_output,
         reasoning_effort=reasoning_effort,
         web_search=web_search,
@@ -438,12 +435,30 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
 # ---------------------------------------------------------------------------
 
 
+def _response_tool_metadata(request: TextGenerationRequest | None) -> dict[str, object]:
+    choice = request.tool_choice if request else None
+    tools = [
+        {"type": "function", "name": tool.name, "description": tool.description,
+         "parameters": tool.parameters, **({"strict": tool.strict} if tool.strict is not None else {})}
+        for tool in (request.tools if request else ())
+    ]
+    if request and request.web_search:
+        tools.append({"type": "web_search"})
+    return {
+        "tool_choice": ({"type": "function", "name": choice.name} if choice and choice.mode == "function"
+                        else choice.mode if choice else "auto"),
+        "tools": tools,
+        "parallel_tool_calls": choice.parallel_tool_calls if choice else True,
+    }
+
+
 def internal_to_openai_responses_response(
     result: TextGenerationResponse,
     model: str,
     *,
     max_output_tokens: int | None = None,
     structured_output: StructuredOutputConfig | None = None,
+    request: TextGenerationRequest | None = None,
 ) -> dict[str, object]:
     """Convert an internal text result to Responses format."""
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -519,7 +534,7 @@ def internal_to_openai_responses_response(
         "model": model,
         "output": output,
         "output_text": "".join(output_text_parts),
-        "parallel_tool_calls": True,
+        **_response_tool_metadata(request),
         "previous_response_id": None,
         "store": False,
         "text": {"format": _structured_output_to_responses_format(structured_output)},
@@ -545,8 +560,10 @@ class OpenAIResponsesStreamAccumulator:
         usage: TokenUsage | None = None,
         max_output_tokens: int | None = None,
         structured_output: StructuredOutputConfig | None = None,
+        request: TextGenerationRequest | None = None,
     ) -> None:
         self.model = model
+        self._tool_metadata = _response_tool_metadata(request)
         self.response_id = f"resp_{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
         self.started = False
@@ -593,14 +610,12 @@ class OpenAIResponsesStreamAccumulator:
             "max_output_tokens": self.max_output_tokens,
             "model": self.model,
             "output": list(self._completed_output),
-            "parallel_tool_calls": True,
+            **self._tool_metadata,
             "previous_response_id": None,
             "reasoning": {"effort": None, "summary": None},
             "store": False,
             "temperature": 1,
             "text": {"format": _structured_output_to_responses_format(self.structured_output)},
-            "tool_choice": "auto",
-            "tools": [],
             "top_p": 1,
             "truncation": "disabled",
             "usage": usage,
@@ -625,6 +640,10 @@ class OpenAIResponsesStreamAccumulator:
 
         if event.kind == "reasoning_delta" and event.reasoning_content:
             if not self._reasoning_started:
+                if self._content_part_started:
+                    events.extend(self._end_content_part())
+                if self._message_started:
+                    events.extend(self._end_message_output())
                 events.extend(self._start_reasoning_output())
             events.append(self.sse("response.reasoning_text.delta", {
                 "type": "response.reasoning_text.delta",
@@ -737,6 +756,7 @@ class OpenAIResponsesStreamAccumulator:
         self._pending_tool_calls.clear()
 
     def _start_message_output(self) -> list[str]:
+        self._full_text = ""
         self._current_msg_id = f"msg_{uuid.uuid4().hex[:24]}"
         self._message_started = True
         self.current_type = "text"
@@ -896,6 +916,31 @@ class OpenAIResponsesStreamAccumulator:
         events.append(self.sse(terminal_event, self._base_response(status)))
         events.append("data: [DONE]\n\n")
         return events
+
+    def fail(self, message: str, error_type: str) -> list[str]:
+        """Emit a terminal failed response without completing pending output."""
+        if self._finished:
+            return []
+        self._finished = True
+        error_event = self.sse(
+            "error",
+            {
+                "type": "error",
+                "code": error_type,
+                "message": message,
+                "param": None,
+            },
+        )
+        response = self._base_response("failed")
+        response["error"] = {
+            "code": error_type,
+            "message": message,
+        }
+        return [
+            error_event,
+            self.sse("response.failed", response),
+            "data: [DONE]\n\n",
+        ]
 
     def sse(self, event_type: str, data: dict[str, object]) -> str:
         if data.get("object") == "response":

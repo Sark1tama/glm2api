@@ -25,7 +25,6 @@ class _StopSequenceFilter:
     sequences: tuple[str, ...] = ()
     pending: str = ""
     matched: str | None = None
-    _accepted_parts: list[str] = field(default_factory=list)
 
     def consume(self, text: str) -> str:
         if not text:
@@ -46,7 +45,6 @@ class _StopSequenceFilter:
             accepted = combined[: match[0]]
             self.pending = ""
             self.matched = match[2]
-            self._accepted_parts.append(accepted)
             return accepted
 
         hold_length = max((len(sequence) for sequence in self.sequences), default=1) - 1
@@ -59,7 +57,6 @@ class _StopSequenceFilter:
         else:
             accepted = combined[:-hold_length]
             self.pending = combined[-hold_length:]
-        self._accepted_parts.append(accepted)
         return accepted
 
     def flush(self) -> str:
@@ -67,14 +64,7 @@ class _StopSequenceFilter:
             return ""
         accepted = self.pending
         self.pending = ""
-        self._accepted_parts.append(accepted)
         return accepted
-
-    def text(self) -> str:
-        if not self.sequences:
-            return ""
-        pending = "" if self.matched is not None else self.pending
-        return "".join(self._accepted_parts) + pending
 
 
 def effective_event_status(event: dict[str, object]) -> object:
@@ -130,7 +120,6 @@ class GLMUpstreamEventAccumulator:
     _part_reasoning_accumulated: dict[str, str] = field(default_factory=dict)
     _part_text_modes: dict[str, str] = field(default_factory=dict)
     _part_reasoning_modes: dict[str, str] = field(default_factory=dict)
-    _deferred_visible_text: str = ""
     input_tokens_estimate: int = 0
     usage: TokenUsage | None = None
     tool_choice: ToolChoice | None = None
@@ -138,8 +127,12 @@ class GLMUpstreamEventAccumulator:
     stop_sequences: tuple[str, ...] = ()
     tool_name_map: ClientToolNameMap | None = None
     _provider_tool_names: set[str] = field(default_factory=set)
+    _unqualified_tool_names: set[str] = field(default_factory=set)
+    _structured_client_tool_calls: list[dict[str, object]] = field(default_factory=list)
+    _structured_client_tool_call_keys: set[str] = field(default_factory=set)
     _output_budget: OutputTokenBudget = field(init=False, repr=False)
     _stop_filter: _StopSequenceFilter = field(init=False, repr=False)
+    _visible_text_parts: list[str] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if self.allowed_tool_names is None:
@@ -173,19 +166,21 @@ class GLMUpstreamEventAccumulator:
 
     def has_client_tool_call(self) -> bool:
         """Return whether this attempt produced a request-declared client call."""
-        if self.allowed_tool_names is None:
+        if self.allowed_tool_names is None or self.stop_sequence_matched is not None:
             return False
-        _, text_calls = parse_tool_calls_from_text(
-            self._effective_full_text().strip(),
-            allowed_tool_names=self.allowed_tool_names,
-        )
+        if self._structured_client_tool_calls:
+            return True
         return bool(
             sanitize_tool_calls(
-                text_calls,
+                self.tool_parser.tool_calls,
                 fallback_url=self.fallback_tool_url,
                 tool_name_map=self.tool_name_map,
             )
         )
+
+    def has_recoverable_structured_tool_call(self, payload: dict[str, object]) -> bool:
+        """Return whether an upstream structured call belongs to this request."""
+        return bool(self._extract_structured_client_tool_calls(payload))
 
     def usage_snapshot(self) -> TokenUsage:
         """Return usage observed so far for a discarded upstream attempt."""
@@ -208,6 +203,7 @@ class GLMUpstreamEventAccumulator:
 
         for part in payload.get("parts", []) if isinstance(payload.get("parts"), list) else []: # pyright: ignore[reportGeneralTypeIssues]
             if isinstance(part, dict):
+                self._record_structured_client_tool_calls(part)
                 self._record_provider_tool_activity(part)
             if isinstance(part, dict) and part.get("logic_id"):
                 logic_id = str(part["logic_id"])
@@ -247,26 +243,22 @@ class GLMUpstreamEventAccumulator:
                 )
             )
 
-        visible_text_delta = self.tool_parser.consume(
-            self._stop_filter.consume(text_delta)
-        )
+        visible_text_delta = self._stop_filter.consume(self.tool_parser.consume(text_delta))
         if visible_text_delta:
-            if self.allowed_tool_names:
-                self._deferred_visible_text += visible_text_delta
-            else:
-                accepted_visible_text = self._output_budget.accept_text(visible_text_delta)
-                if accepted_visible_text:
-                    role = None
-                    if not self.emitted_role:
-                        role = "assistant"
-                        self.emitted_role = True
-                    events.append(
-                        self._stream_event(
-                            "text_delta",
-                            role=role,
-                            text=accepted_visible_text,
-                        )
+            self._visible_text_parts.append(visible_text_delta)
+            accepted_visible_text = self._output_budget.accept_text(visible_text_delta)
+            if accepted_visible_text:
+                role = None
+                if not self.emitted_role:
+                    role = "assistant"
+                    self.emitted_role = True
+                events.append(
+                    self._stream_event(
+                        "text_delta",
+                        role=role,
+                        text=accepted_visible_text,
                     )
+                )
         debug_dump(
             self.logger or logging.getLogger("glm2api.null"),
             self.debug_enabled,
@@ -278,13 +270,21 @@ class GLMUpstreamEventAccumulator:
     def _record_provider_tool_activity(self, part: dict[str, object]) -> None:
         meta_data = part.get("meta_data")
         observed_names: set[str] = set()
+        unqualified_names: set[str] = set()
+
+        def record_name(tool_name: str) -> None:
+            if not tool_name or tool_name == "finish" or self._is_client_tool_name(tool_name):
+                return
+            if self._is_unqualified_client_tool_name(tool_name):
+                unqualified_names.add(tool_name)
+            else:
+                observed_names.add(tool_name)
 
         if isinstance(meta_data, dict):
             tool_result_extra = meta_data.get("tool_result_extra")
             if isinstance(tool_result_extra, dict):
                 tool_name = str(tool_result_extra.get("tool_call_name", "")).strip()
-                if tool_name and tool_name != "finish":
-                    observed_names.add(tool_name)
+                record_name(tool_name)
 
         if isinstance(part.get("content"), list):
             for content in part["content"]:
@@ -293,14 +293,24 @@ class GLMUpstreamEventAccumulator:
                 tool_call = content.get("tool_calls")
                 if isinstance(tool_call, dict):
                     tool_name = str(tool_call.get("name", "")).strip()
-                    if tool_name and tool_name != "finish":
-                        observed_names.add(tool_name)
+                    record_name(tool_name)
 
         new_names = observed_names - self._provider_tool_names
         self._provider_tool_names.update(observed_names)
+        new_unqualified_names = unqualified_names - self._unqualified_tool_names
+        self._unqualified_tool_names.update(unqualified_names)
         if self.logger:
             for tool_name in sorted(new_names):
                 self.logger.info("检测到 GLM Provider 工具活动 tool=%s", tool_name)
+            for tool_name in sorted(new_unqualified_names):
+                self.logger.info("检测到 GLM 未限定工具活动 tool=%s", tool_name)
+
+    def _flush_visible_text(self) -> tuple[str, list[dict[str, object]]]:
+        tail_text, tool_calls = self.tool_parser.flush()
+        tail = self._stop_filter.consume(tail_text) + self._stop_filter.flush()
+        if tail:
+            self._visible_text_parts.append(tail)
+        return tail, tool_calls
 
     def finalize(
         self,
@@ -308,25 +318,24 @@ class GLMUpstreamEventAccumulator:
         last_error: dict[str, object] | None = None,
     ) -> list[TextStreamEvent]:
         """Finalize into protocol-neutral stream events."""
-        stop_tail = self.tool_parser.consume(self._stop_filter.flush())
-        tail_text, xml_tool_calls = self.tool_parser.flush()
+        stop_tail, xml_tool_calls = self._flush_visible_text()
         all_tool_calls, xml_tool_calls = self._collect_tool_calls(xml_tool_calls)
 
         if self.logger:
             self.logger.info(
-                "响应收尾 status=%s text_len=%s reasoning_len=%s tool_calls=%s provider_tools=%s",
+                "响应收尾 status=%s text_len=%s reasoning_len=%s tool_calls=%s provider_tools=%s unqualified_tools=%s",
                 status,
                 len(self._cached_full_text),
                 len(self._cached_full_reasoning),
-                len(xml_tool_calls),
+                len(all_tool_calls),
                 ",".join(sorted(self._provider_tool_names)) or "(none)",
+                ",".join(sorted(self._unqualified_tool_names)) or "(none)",
             )
 
         events: list[TextStreamEvent] = []
-        final_text = self._deferred_visible_text + stop_tail + tail_text
-        self._deferred_visible_text = ""
+        final_text = stop_tail
         source_text = self._effective_full_text()
-        if not final_text and not all_tool_calls and self.allowed_tool_names is not None:
+        if not final_text and not all_tool_calls and self.allowed_tool_names is not None and self.stop_sequence_matched is None:
             _, attempted_tool_calls = parse_tool_calls_from_text(
                 source_text.strip(),
                 allowed_tool_names=None,
@@ -347,12 +356,7 @@ class GLMUpstreamEventAccumulator:
                     + ", ".join(f"`{name}`" for name in unavailable_names)
                     + f"，已阻止。本轮只允许这些工具：{allowed_names}。"
                 )
-        # A completed tool call is the response payload.  This accumulator has
-        # always suppressed any accompanying narration, so it must not consume
-        # budget that belongs to the call.
-        accepted_final_text = self._output_budget.accept_text(
-            "" if all_tool_calls else final_text
-        )
+        accepted_final_text = self._output_budget.accept_text(final_text)
 
         intervention_text = ""
         if status == "intervene" and last_error and last_error.get("intervene_text"):
@@ -380,7 +384,7 @@ class GLMUpstreamEventAccumulator:
             allow_missing=finish_reason == "length",
         )
 
-        if accepted_final_text and not accepted_tool_calls:
+        if accepted_final_text:
             role = None
             if not self.emitted_role:
                 role = "assistant"
@@ -451,15 +455,10 @@ class GLMUpstreamEventAccumulator:
         _, full_reasoning = self._render_full_output()
         if not full_reasoning and self.last_full_reasoning:
             full_reasoning = self.last_full_reasoning
-        self._stop_filter.flush()
         full_text = self._effective_full_text()
-        clean_content, xml_tool_calls = parse_tool_calls_from_text(
-            full_text.strip(),
-            allowed_tool_names=self.allowed_tool_names,
-        )
+        _, xml_tool_calls = self._flush_visible_text()
+        final_content = "".join(self._visible_text_parts).strip()
         all_tool_calls, _ = self._collect_tool_calls(xml_tool_calls)
-
-        final_content = "" if all_tool_calls else clean_content.strip()
         bounded = bound_output(
             self.max_output_tokens,
             reasoning=full_reasoning,
@@ -502,7 +501,7 @@ class GLMUpstreamEventAccumulator:
             )
         message = Message(
             role="assistant",
-            content=None if internal_tool_calls or not bounded.text else bounded.text,
+            content=bounded.text or None,
             reasoning_content=bounded.reasoning or None,
             tool_calls=tuple(internal_tool_calls),
         )
@@ -532,8 +531,6 @@ class GLMUpstreamEventAccumulator:
         return response
 
     def _effective_full_text(self) -> str:
-        if self._stop_filter.sequences:
-            return self._stop_filter.text()
         full_text, _ = self._render_full_output()
         return full_text or self.last_full_text
 
@@ -546,7 +543,7 @@ class GLMUpstreamEventAccumulator:
         self,
         parsed_tool_calls: list[dict[str, object]],
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-        """Normalize executable calls parsed from assistant text."""
+        """Normalize DSML and recovered structured client calls."""
         xml_tool_calls = sanitize_tool_calls(
             parsed_tool_calls,
             fallback_url=self.fallback_tool_url,
@@ -554,12 +551,110 @@ class GLMUpstreamEventAccumulator:
         )
 
         all_tool_calls: list[dict[str, object]] = []
-        for tool_call in xml_tool_calls:
+        seen_ids: set[str] = set()
+        for tool_call in (*xml_tool_calls, *self._structured_client_tool_calls):
+            tool_call_id = str(tool_call.get("id", "")).strip()
+            if tool_call_id and tool_call_id in seen_ids:
+                continue
+            if tool_call_id:
+                seen_ids.add(tool_call_id)
             normalized_call = dict(tool_call)
             normalized_call["index"] = len(all_tool_calls)
             all_tool_calls.append(normalized_call)
 
+        if self.stop_sequence_matched is not None:
+            return [], []
+        if self.tool_choice is not None and not self.tool_choice.parallel_tool_calls:
+            all_tool_calls = all_tool_calls[:1]
         return all_tool_calls, xml_tool_calls
+
+    def _record_structured_client_tool_calls(self, part: dict[str, object]) -> None:
+        for tool_call in self._extract_structured_client_tool_calls(
+            {"parts": [part]}
+        ):
+            tool_call_id = str(tool_call.get("id", "")).strip()
+            key = tool_call_id or safe_json_dumps(tool_call)
+            if key in self._structured_client_tool_call_keys:
+                continue
+            self._structured_client_tool_call_keys.add(key)
+            normalized_call = dict(tool_call)
+            normalized_call["index"] = len(self._structured_client_tool_calls)
+            self._structured_client_tool_calls.append(normalized_call)
+            if self.logger:
+                function = normalized_call.get("function")
+                tool_name = function.get("name") if isinstance(function, dict) else ""
+                self.logger.info("恢复结构化客户端工具调用 tool=%s", tool_name)
+
+    def _extract_structured_client_tool_calls(
+        self,
+        payload: dict[str, object],
+    ) -> list[dict[str, object]]:
+        allowed_tool_names = {
+            name
+            for name in (self.allowed_tool_names or set())
+            if self._is_client_tool_name(name)
+        }
+        if not allowed_tool_names:
+            return []
+
+        parts = payload.get("parts")
+        if not isinstance(parts, list):
+            return []
+
+        candidates: list[dict[str, object]] = []
+        for part_index, part in enumerate(parts):
+            if not isinstance(part, dict):
+                continue
+            contents = part.get("content")
+            if not isinstance(contents, list):
+                continue
+            for content_index, content in enumerate(contents):
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") not in {"tool_calls", "tool_result"}:
+                    continue
+                raw_calls = content.get("tool_calls")
+                call_items = raw_calls if isinstance(raw_calls, list) else [raw_calls]
+                for call_index, raw_call in enumerate(call_items):
+                    if not isinstance(raw_call, dict):
+                        continue
+                    tool_name = str(raw_call.get("name", "")).strip()
+                    if not tool_name or tool_name not in allowed_tool_names:
+                        continue
+                    call_id = str(
+                        raw_call.get("id")
+                        or raw_call.get("tool_call_id")
+                        or (
+                            f"call_structured_{part.get('logic_id', part_index)}_"
+                            f"{content_index}_{call_index}"
+                        )
+                    ).strip()
+                    candidate = {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": raw_call.get("arguments", "{}"),
+                        },
+                    }
+                    candidates.extend(
+                        sanitize_tool_calls(
+                            [candidate],
+                            fallback_url=self.fallback_tool_url,
+                            tool_name_map=self.tool_name_map,
+                        )
+                    )
+        return candidates
+
+    def _is_client_tool_name(self, name: str) -> bool:
+        return (
+            self.tool_name_map is not None
+            and name in (self.allowed_tool_names or set())
+            and name in self.tool_name_map.aliases
+        )
+
+    def _is_unqualified_client_tool_name(self, name: str) -> bool:
+        return self.tool_name_map is not None and name in self.tool_name_map.original_to_alias
 
     def _validate_tool_choice(
         self,
@@ -569,6 +664,8 @@ class GLMUpstreamEventAccumulator:
         allow_missing: bool = False,
     ) -> None:
         choice = self.tool_choice
+        if self.stop_sequence_matched is not None:
+            return
         if choice is None or choice.mode == "auto":
             return
 

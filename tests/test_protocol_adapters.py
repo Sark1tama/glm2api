@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+
+
 from glm2api.api import server as server_module
 from glm2api.api.adapters.anthropic.messages import (
     AnthropicMessagesStreamAccumulator,
@@ -20,6 +22,7 @@ from glm2api.glm.auth import GLMAccessTokenManager
 from glm2api.glm.client import ConcurrentRequestQueue, GLMWebClient, QueueLease, UpstreamAPIError
 from glm2api.glm.errors import QueueTimeoutError
 from glm2api.glm.events import GLMUpstreamEventAccumulator
+from glm2api.glm.tools.names import ClientToolNameMap
 from glm2api.glm.translator import convert_messages_to_glm_prompt
 from glm2api.core.models import (
     ContentBlock,
@@ -39,6 +42,30 @@ from glm2api.api.adapters.openai.responses import (
     internal_to_openai_responses_response,
     openai_responses_to_internal,
 )
+
+
+def test_responses_alternating_text_and_reasoning_preserves_item_indices():
+    accumulator = OpenAIResponsesStreamAccumulator(model="test")
+    chunks = []
+    for event in (
+        TextStreamEvent(kind="text_delta", text="before"),
+        TextStreamEvent(kind="reasoning_delta", reasoning_content="thinking"),
+        TextStreamEvent(kind="text_delta", text="after"),
+        TextStreamEvent(kind="finish", finish_reason="stop"),
+    ):
+        chunks.extend(accumulator.feed_event(event))
+    payloads = [json.loads(line[6:]) for chunk in chunks for line in chunk.splitlines() if line.startswith("data: {")]
+    added = [p for p in payloads if p.get("type") == "response.output_item.added"]
+    assert [p["output_index"] for p in added] == [0, 1, 2]
+    indices = {p["item"]["id"]: p["output_index"] for p in added}
+    for payload in payloads:
+        item_id = payload.get("item_id") or payload.get("item", {}).get("id")
+        if item_id in indices:
+            assert payload["output_index"] == indices[item_id]
+    done = [p["item"] for p in payloads if p.get("type") == "response.output_item.done"]
+    assert [item["content"][0]["text"] for item in done] == ["before", "thinking", "after"]
+    completed = next(p for p in payloads if p.get("type") == "response.completed")
+    assert completed["response"]["output"] == done
 
 
 class _DummyConfig:
@@ -108,7 +135,7 @@ def test_openai_responses_to_internal_enables_standard_web_search_tool():
     assert converted.web_search is True
 
 
-def test_openai_chat_completions_ignores_nonstandard_web_search_flag():
+def test_openai_chat_completions_accepts_explicit_web_search_flag():
     converted = openai_chat_completions_to_internal(
         {
             "model": "glm-5.3-flash",
@@ -117,7 +144,44 @@ def test_openai_chat_completions_ignores_nonstandard_web_search_flag():
         }
     )
 
+    assert converted.web_search is True
+
+
+def test_openai_chat_completions_accepts_web_search_tool_declaration():
+    converted = openai_chat_completions_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "联网查询"}],
+            "tools": [
+                {"type": "web_search"},
+                {
+                    "type": "function",
+                    "function": {"name": "terminal", "parameters": {"type": "object"}},
+                },
+            ],
+        }
+    )
+
+    assert converted.web_search is True
+    assert [tool.name for tool in converted.tools] == ["terminal"]
+
+
+def test_openai_chat_completions_keeps_function_named_web_search_as_client_tool():
+    converted = openai_chat_completions_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "调用搜索工具"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "web_search", "parameters": {"type": "object"}},
+                }
+            ],
+        }
+    )
+
     assert converted.web_search is False
+    assert [tool.name for tool in converted.tools] == ["web_search"]
 
 
 def test_openai_responses_to_internal_preserves_reasoning_input_item():
@@ -2092,7 +2156,7 @@ def test_anthropic_stream_writes_error_without_message_stop_on_upstream_failure(
     assert "message_stop" not in output
 
 
-def test_responses_stream_writes_error_without_completion_on_upstream_failure():
+def test_responses_stream_writes_failed_terminal_event_on_upstream_failure():
     class FailingGLM:
         def stream_chat_completion(self, payload):
             def generate():
@@ -2109,6 +2173,93 @@ def test_responses_stream_writes_error_without_completion_on_upstream_failure():
     assert "event: error\n" in output
     assert '"type":"error"' in output
     assert "response.completed" not in output
+    assert "event: response.failed\n" in output
+    assert '"status":"failed"' in output
+    assert output.endswith("data: [DONE]\n\n")
+    payloads = [
+        json.loads(block.split("data: ", 1)[1])
+        for block in output.split("\n\n")
+        if "data: " in block and "[DONE]" not in block
+    ]
+    assert [payload["type"] for payload in payloads] == ["error", "response.failed"]
+    assert [payload["sequence_number"] for payload in payloads] == [0, 1]
+
+
+def test_responses_failure_does_not_complete_pending_tool_call():
+    accumulator = OpenAIResponsesStreamAccumulator(model="glm-4")
+    accumulator.start_response()
+    accumulator.feed_event(
+        TextStreamEvent(
+            kind="tool_call_delta",
+            tool_call=ToolCallDelta(index=0, id="call_1", name="terminal", arguments="{}"),
+        )
+    )
+
+    events = accumulator.fail("upstream disconnected", "upstream_error")
+
+    assert "event: response.output_item.done\n" not in "".join(events)
+    assert "event: response.failed\n" in "".join(events)
+    assert events[-1] == "data: [DONE]\n\n"
+
+
+def test_chat_completions_stream_writes_error_and_done_without_fake_finish():
+    class FailingGLM:
+        def stream_chat_completion(self, payload):
+            def generate():
+                raise UpstreamAPIError(status_code=502, message="upstream disconnected")
+                yield b""
+
+            return generate()
+
+    handler = _build_stream_test_handler(FailingGLM())
+    handler.path = "/v1/chat/completions"
+    handler._stream_completion(
+        {
+            "model": "glm-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+    )
+    output = handler.wfile.getvalue().decode("utf-8")
+
+    assert '"type":"upstream_error"' in output
+    assert output.endswith("data: [DONE]\n\n")
+    assert "finish_reason" not in output
+
+
+def test_bare_declared_client_tool_is_not_recovered_or_called():
+    logs: list[str] = []
+    accumulator = GLMUpstreamEventAccumulator(
+        model="glm-4",
+        allowed_tool_names={"client__terminal"},
+        logger=SimpleNamespace(info=lambda message, *args: logs.append(message % args)),
+        tool_name_map=ClientToolNameMap.from_tools([ToolDefinition(name="terminal")]),
+    )
+    event = {
+        "status": "error",
+        "parts": [
+            {
+                "logic_id": "bare-tool",
+                "status": "error",
+                "content": [
+                    {
+                        "type": "tool_calls",
+                        "tool_calls": {
+                            "id": "call_bare",
+                            "name": "terminal",
+                            "arguments": "{\"command\":\"pwd\"}",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    assert accumulator.has_recoverable_structured_tool_call(event) is False
+    accumulator.consume_event(event)
+    assert accumulator.has_client_tool_call() is False
+    assert logs == ["检测到 GLM 未限定工具活动 tool=terminal"]
+    assert accumulator.provider_tool_names == frozenset()
 
 
 def test_anthropic_error_response_uses_standard_envelope_and_request_id():

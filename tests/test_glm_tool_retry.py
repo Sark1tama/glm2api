@@ -112,6 +112,36 @@ def _successful_tool_event():
     }
 
 
+def _structured_client_tool_error_event(conversation_id: str = "structured"):
+    return {
+        "conversation_id": conversation_id,
+        "status": "init",
+        "parts": [
+            {
+                "logic_id": "structured-client-tool",
+                "status": "error",
+                "content": [
+                    {
+                        "type": "tool_calls",
+                        "tool_calls": {
+                            "id": "call_structured_client",
+                            "name": "client__terminal",
+                            "arguments": '{"command":"uname -a"}',
+                        },
+                    }
+                ],
+                "meta_data": {"show_type": "mc_tool_call"},
+            }
+        ],
+    }
+
+
+def _bare_client_tool_error_event(conversation_id: str = "bare"):
+    event = _structured_client_tool_error_event(conversation_id)
+    event["parts"][0]["content"][0]["tool_calls"]["name"] = "terminal"
+    return event
+
+
 def test_non_streaming_private_tool_result_is_discarded_and_retried_once():
     client, responses, opened, deleted, released, warnings = _client_for_attempts(
         [[_private_tool_event()], [_successful_tool_event()]]
@@ -135,8 +165,10 @@ def test_non_streaming_private_tool_result_is_discarded_and_retried_once():
 
 
 def test_streaming_retry_does_not_emit_discarded_attempt_events():
+    private_event = _private_tool_event()
+    private_event["parts"][0]["content"] = []
     client, responses, opened, deleted, released, _ = _client_for_attempts(
-        [[_private_tool_event()], [_successful_tool_event()]]
+        [[private_event], [_successful_tool_event()]]
     )
     request = _request(stream=True, tool_choice=ToolChoice(mode="required"))
 
@@ -151,6 +183,160 @@ def test_streaming_retry_does_not_emit_discarded_attempt_events():
     assert len(opened) == 2
     assert all(response.closed for response in responses)
     assert deleted == ["bad", "good"]
+    assert released == [0]
+
+
+def test_non_streaming_preserves_text_alongside_tool_call():
+    payload = _successful_tool_event()
+    payload["parts"][0]["content"][0]["text"] = "Checking now.\n" + payload["parts"][0]["content"][0]["text"]
+    client, _, _, _, _, _ = _client_for_attempts([[payload]])
+    response, _ = client.chat_completion(_request())
+    assert response.message.content == "Checking now."
+    assert [call.name for call in response.message.tool_calls] == ["terminal"]
+    assert response.finish_reason == "tool_calls"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("split", [False, True])
+def test_dsml_handoff_discards_suffix_and_stops_upstream(streaming, split):
+    text = _successful_tool_event()["parts"][0]["content"][0]["text"]
+
+    def upstream():
+        pieces = ["Checking. " + text + "Invented result."]
+        if split:
+            pieces = ["Checking. " + text[:-2], text[-2:] + "Invented result."]
+        accumulated = ""
+        for piece in pieces:
+            accumulated += piece
+            yield {"status": "init", "conversation_id": "handoff", "parts": [
+                {"logic_id": "call", "content": [{"type": "text", "text": accumulated}]}
+            ]}
+        raise AssertionError("Must not read upstream after complete DSML call")
+
+    client, responses, opened, _, released, _ = _client_for_attempts([upstream()])
+    request = _request(stream=streaming)
+    if streaming:
+        events = list(client.stream_chat_completion(request))
+        assert "".join(event.text for event in events).strip() == "Checking."
+        assert [event.tool_call.name for event in events if event.kind == "tool_call_delta"] == ["terminal"]
+        assert events[-1].kind == "done"
+    else:
+        response, _ = client.chat_completion(request)
+        assert response.message.content == "Checking."
+        assert [call.name for call in response.message.tool_calls] == ["terminal"]
+    assert len(opened) == 1
+    assert responses[0].closed
+    assert released == [0]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_required_tool_accepts_client_call_after_sandbox_activity(streaming):
+    client, responses, opened, _, released, _ = _client_for_attempts(
+        [[_private_tool_event(), _successful_tool_event()]]
+    )
+    request = _request(stream=streaming, tool_choice=ToolChoice(mode="required"))
+    if streaming:
+        events = list(client.stream_chat_completion(request))
+        assert [event.tool_call.name for event in events if event.kind == "tool_call_delta"] == ["terminal"]
+        assert events[-1].kind == "done"
+    else:
+        response, _ = client.chat_completion(request)
+        assert [call.name for call in response.message.tool_calls] == ["terminal"]
+    assert len(opened) == 1
+    assert responses[0].closed
+    assert released == [0]
+
+
+@pytest.mark.parametrize("content_type,kind", [("text", "text_delta"), ("think", "reasoning_delta")])
+@pytest.mark.parametrize("ending", ["tool", "sandbox", "error"])
+def test_stream_delivers_content_before_reading_next_upstream_event(content_type, kind, ending):
+    advanced = []
+
+    def upstream():
+        yield {
+            "conversation_id": "live",
+            "parts": [{"logic_id": "intro", "content": [{"type": content_type, content_type: "Checking now."}]}],
+        }
+        advanced.append(True)
+        if ending == "tool":
+            yield _successful_tool_event()
+        elif ending == "sandbox":
+            yield _private_tool_event()
+        else:
+            yield {"status": "error", "last_error": {"message": "upstream failed"}}
+
+    client, responses, opened, _, released, _ = _client_for_attempts([upstream()])
+    stream = client.stream_chat_completion(_request(stream=True, tool_choice=ToolChoice(mode="required")))
+    first = next(stream)
+    assert first.kind == kind
+    assert (first.text or first.reasoning_content) == "Checking now."
+    assert advanced == []
+    if ending == "tool":
+        remaining = list(stream)
+        assert any(event.kind == "tool_call_delta" for event in remaining)
+        assert remaining[-1].kind == "done"
+    else:
+        with pytest.raises(UpstreamAPIError):
+            list(stream)
+    assert len(opened) == 1
+    assert responses[0].closed
+    assert released == [0]
+
+
+def test_non_streaming_recovers_structured_client_tool_after_provider_route_error():
+    client, responses, opened, deleted, released, warnings = _client_for_attempts(
+        [[_structured_client_tool_error_event()]]
+    )
+
+    result, conversation_id = client.chat_completion(
+        _request(tool_choice=ToolChoice(mode="required"))
+    )
+
+    assert conversation_id == "structured"
+    assert [(call.id, call.name, call.arguments) for call in result.message.tool_calls] == [
+        ("call_structured_client", "terminal", '{"command":"uname -a"}')
+    ]
+    assert result.finish_reason == "tool_calls"
+    assert len(opened) == 1
+    assert responses[0].closed is True
+    assert deleted == ["structured"]
+    assert released == [0]
+    assert warnings == []
+
+
+def test_streaming_recovers_structured_client_tool_after_provider_route_error():
+    client, responses, opened, deleted, released, _ = _client_for_attempts(
+        [[_structured_client_tool_error_event()]]
+    )
+
+    events = list(
+        client.stream_chat_completion(
+            _request(stream=True, tool_choice=ToolChoice(mode="required"))
+        )
+    )
+
+    tool_events = [event for event in events if event.kind == "tool_call_delta"]
+    assert [(event.tool_call.id, event.tool_call.name, event.tool_call.arguments) for event in tool_events] == [
+        ("call_structured_client", "terminal", '{"command":"uname -a"}')
+    ]
+    assert next(event for event in events if event.kind == "finish").finish_reason == "tool_calls"
+    assert len(opened) == 1
+    assert responses[0].closed is True
+    assert deleted == ["structured"]
+    assert released == [0]
+
+
+def test_bare_client_tool_name_is_rejected_without_retry_or_execution():
+    client, responses, opened, deleted, released, _ = _client_for_attempts(
+        [[_bare_client_tool_error_event()]]
+    )
+
+    with pytest.raises(UpstreamAPIError, match="GLM part status error"):
+        client.chat_completion(_request(tool_choice=ToolChoice(mode="required")))
+
+    assert len(opened) == 1
+    assert responses[0].closed is True
+    assert deleted == [""]
     assert released == [0]
 
 

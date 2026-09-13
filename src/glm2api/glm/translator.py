@@ -313,9 +313,9 @@ def parse_tool_choice_policy(
         return {"mode": "auto", "tool_name": None}
     if tool_choice.mode == "function":
         if tool_choice.name and tool_choice.name in (available_tool_names or set()):
-            return {"mode": "specific", "tool_name": tool_choice.name}
+            return {"mode": "specific", "tool_name": tool_choice.name, "parallel_tool_calls": tool_choice.parallel_tool_calls}
         raise ValueError(f"tool_choice 指定的工具不可用: {tool_choice.name}")
-    return {"mode": tool_choice.mode, "tool_name": None}
+    return {"mode": tool_choice.mode, "tool_name": None, "parallel_tool_calls": tool_choice.parallel_tool_calls}
 
 
 def convert_messages_to_glm_prompt(

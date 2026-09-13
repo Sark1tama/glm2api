@@ -11,6 +11,7 @@ import hashlib
 import json
 import time
 import uuid
+from dataclasses import replace
 from logging import Logger
 
 from ....config import DEFAULT_CHAT_MODEL_NAME
@@ -540,6 +541,11 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
             normalized_tool_choice = ToolChoice(mode="function", name=name)
         else:
             raise ValueError(f"Anthropic tool_choice.type 暂不支持: {choice_type or '<missing>'}")
+
+        disable_parallel = tool_choice.get("disable_parallel_tool_use", False)
+        if not isinstance(disable_parallel, bool):
+            raise ValueError("Anthropic disable_parallel_tool_use 必须是布尔值")
+        normalized_tool_choice = replace(normalized_tool_choice, parallel_tool_calls=not disable_parallel)
 
     # --- output config and thinking ---
     output_config = payload.get("output_config")

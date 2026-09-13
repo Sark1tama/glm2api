@@ -414,8 +414,10 @@ def _extract_tool_blocks(
                 tool_call["index"] = offset
             spans.append(parsed_span)
             tool_calls.extend(block_calls)
-            cursor = end
-            continue
+            # A complete call hands control to the client. Ignore everything
+            # after this block, including claims about results not yet received.
+            spans.append((end, len(text)))
+            break
         if match.group("tag").lower() in {"|dsml|tool_calls", "tool_calls", "ml_tool_calls", "ml_tool_call"}:
             spans.append((start, end))
             cursor = end
@@ -536,7 +538,7 @@ def _split_stream_text(
     remainder = text[safe_end:]
     spans, tool_calls = _extract_tool_blocks(processable, allowed_tool_names, allow_trailing_close=final)
     visible = _remove_spans(processable, spans, trim_outer_whitespace=final)
-    return visible, remainder, tool_calls
+    return visible, "" if tool_calls else remainder, tool_calls
 
 
 def parse_tool_calls_from_text(text: str, allowed_tool_names: set[str] | None = None) -> tuple[str, list[dict[str, object]]]:
@@ -553,7 +555,7 @@ class StreamingToolParser:
     allowed_tool_names: set[str] | None = None
 
     def consume(self, chunk: str) -> str:
-        if not chunk:
+        if not chunk or self.tool_calls:
             return ""
         self.pending_text += chunk
         visible, remainder, parsed_calls = _split_stream_text(

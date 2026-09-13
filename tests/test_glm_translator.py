@@ -407,7 +407,7 @@ def test_output_budget_rejects_later_content_after_truncation():
     assert budget.output_tokens == 0
 
 
-def test_tool_call_budget_ignores_suppressed_preface_in_stream_and_response():
+def test_tool_call_budget_counts_preface_in_stream_and_response():
     payload = {
         "status": "finish",
         "parts": [
@@ -437,18 +437,18 @@ def test_tool_call_budget_ignores_suppressed_preface_in_stream_and_response():
         allowed_tool_names={"Bash"},
         max_output_tokens=140,
     )
-    streaming.consume_event(payload)
+    initial_events, _ = streaming.consume_event(payload)
     non_streaming.consume_event(payload)
 
     events = streaming.finalize(status="finish")
     response = non_streaming.build_response()
 
     assert not any(event.kind == "text_delta" for event in events)
-    assert [event.tool_call.name for event in events if event.kind == "tool_call_delta"] == ["Bash"]
-    assert next(event for event in events if event.kind == "finish").finish_reason == "tool_calls"
-    assert response.message.content is None
-    assert [tool_call.name for tool_call in response.message.tool_calls] == ["Bash"]
-    assert response.finish_reason == "tool_calls"
+    assert not any(event.kind == "tool_call_delta" for event in events)
+    assert next(event for event in events if event.kind == "finish").finish_reason == "length"
+    assert response.message.content == "".join(event.text or "" for event in initial_events).strip()
+    assert not response.message.tool_calls
+    assert response.finish_reason == "length"
 
 
 def test_convert_messages_to_glm_prompt_injects_xml_tool_prompt_and_history():
@@ -924,7 +924,7 @@ def test_sanitize_shell_command_argument_keeps_native_executable_array():
     }
 
 
-def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
+def test_accumulator_preserves_tool_preamble_and_repairs_shell_command_array():
     accumulator = GLMUpstreamEventAccumulator(model="glm-test", allowed_tool_names={"shell"})
     events, status = accumulator.consume_event(
         {
@@ -950,13 +950,13 @@ def test_accumulator_drops_tool_preamble_and_repairs_shell_command_array():
     chunks = _openai_chunks(events)
     final_chunks = _openai_chunks(accumulator.finalize(status))
 
-    assert chunks == []
+    assert "我将创建文件" in "".join(chunks)
     assert "我将创建文件" not in "".join(final_chunks)
-    assert '"tool_calls"' in final_chunks[1]
-    assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[1]
+    assert '"tool_calls"' in final_chunks[0]
+    assert '\\"command\\":[\\"powershell.exe\\",\\"-Command\\",\\"pwd\\"]' in final_chunks[0]
 
 
-def test_accumulator_defers_visible_text_when_tools_available():
+def test_accumulator_emits_visible_text_when_tools_available():
     accumulator = GLMUpstreamEventAccumulator(model="glm-test", allowed_tool_names={"shell"})
     events, status = accumulator.consume_event(
         {
@@ -974,9 +974,8 @@ def test_accumulator_defers_visible_text_when_tools_available():
     chunks = _openai_chunks(events)
     final_chunks = _openai_chunks(accumulator.finalize(status))
 
-    assert chunks == []
-    assert '"content":"你好"' in final_chunks[0]
-    assert '"finish_reason":"stop"' in final_chunks[1]
+    assert '"content":"你好"' in chunks[0]
+    assert '"finish_reason":"stop"' in final_chunks[0]
 
 
 def test_accumulator_reports_unavailable_dsml_tool_instead_of_empty_response():

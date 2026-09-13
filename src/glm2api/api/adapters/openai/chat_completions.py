@@ -291,10 +291,14 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
     if raw_tools is not None and not isinstance(raw_tools, list):
         raise ValueError("OpenAI tools 必须是数组")
     raw_tool_list = raw_tools if isinstance(raw_tools, list) else []
-    tools = tuple(
-        _tool_definition_from_openai(raw_tool, f"tools[{index}]")
-        for index, raw_tool in enumerate(raw_tool_list)
-    )
+    server_web_search = False
+    client_tools: list[ToolDefinition] = []
+    for index, raw_tool in enumerate(raw_tool_list):
+        if isinstance(raw_tool, dict) and str(raw_tool.get("type", "")).startswith("web_search"):
+            server_web_search = True
+            continue
+        client_tools.append(_tool_definition_from_openai(raw_tool, f"tools[{index}]"))
+    tools = tuple(client_tools)
 
     raw_stop = payload.get("stop")
     if isinstance(raw_stop, list):
@@ -337,6 +341,9 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
     reasoning_effort = payload.get("reasoning_effort")
     if reasoning_effort is not None and not isinstance(reasoning_effort, str):
         raise ValueError("OpenAI reasoning_effort 必须是字符串")
+    web_search = payload.get("web_search", False)
+    if not isinstance(web_search, bool):
+        raise ValueError("OpenAI web_search 必须是布尔值")
 
     known_fields = {
         "model",
@@ -349,8 +356,10 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
         "stop",
         "tools",
         "tool_choice",
+        "parallel_tool_calls",
         "response_format",
         "reasoning_effort",
+        "web_search",
     }
     extra = {key: value for key, value in payload.items() if key not in known_fields}
     return TextGenerationRequest(
@@ -362,9 +371,10 @@ def openai_chat_completions_to_internal(payload: Mapping[str, object]) -> TextGe
         top_p=top_p,
         stop=stop,
         tools=tools,
-        tool_choice=tool_choice_from_openai(payload.get("tool_choice")),
+        tool_choice=tool_choice_from_openai(payload.get("tool_choice"), payload.get("parallel_tool_calls", True)),
         structured_output=structured_output,
         reasoning_effort=reasoning_effort,
+        web_search=web_search or server_web_search,
         extra=extra,
     )
 

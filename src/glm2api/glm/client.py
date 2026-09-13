@@ -248,8 +248,12 @@ class GLMWebClient:
                     for event in self.iter_sse_events(response):
                         if not event:
                             continue
-                        self.raise_for_event_error(event, stream=False)
+                        recovered_structured_call = accumulator.has_recoverable_structured_tool_call(event)
+                        if not recovered_structured_call:
+                            self.raise_for_event_error(event, stream=False)
                         _, status = accumulator.consume_event(event)
+                        if recovered_structured_call or accumulator.has_client_tool_call():
+                            break
                         if accumulator.stop_sequence_matched is not None:
                             break
                         if status in {"finish", "intervene"}:
@@ -315,20 +319,25 @@ class GLMWebClient:
                         current_usage,
                         tool_name_map=tool_name_map,
                     )
-                    buffered_events: list[TextStreamEvent] | None = [] if allowed_tool_names else None
+                    content_emitted = False
                     completion_status = "stop"
                     last_error: dict[str, object] | None = None
                     try:
                         for event in self.iter_sse_events(current_response, require_done=True):
                             if not event:
                                 continue
-                            self.raise_for_event_error(event, stream=True)
+                            recovered_structured_call = accumulator.has_recoverable_structured_tool_call(event)
+                            if not recovered_structured_call:
+                                self.raise_for_event_error(event, stream=True)
                             stream_events, status = accumulator.consume_event(event)
-                            if buffered_events is None:
-                                yield from stream_events
-                            else:
-                                buffered_events.extend(stream_events)
+                            for stream_event in stream_events:
+                                if stream_event.kind in {"text_delta", "reasoning_delta", "tool_call_delta"}:
+                                    content_emitted = True
+                                yield stream_event
 
+                            if recovered_structured_call or accumulator.has_client_tool_call():
+                                completion_status = "finish"
+                                break
                             if accumulator.stop_sequence_matched is not None:
                                 completion_status = "stop"
                                 break
@@ -352,7 +361,7 @@ class GLMWebClient:
                         and self._remote_sandbox_replaced_client_tool(accumulator)
                     ):
                         discarded_usage = discarded_usage.plus(accumulator.usage_snapshot())
-                        if attempt == 0 and allowed_tool_names:
+                        if attempt == 0 and allowed_tool_names and not content_emitted:
                             self.logger.warning(
                                 "GLM 远程沙箱替代了客户端工具，丢弃流式结果并重试",
                             )
@@ -368,20 +377,10 @@ class GLMWebClient:
                         status=completion_status,
                         last_error=last_error,
                     )
-                    if buffered_events is None:
-                        yield from final_events
-                    else:
-                        buffered_events.extend(final_events)
-
-                    if buffered_events is not None:
-                        combined_events = self._add_discarded_stream_usage(
-                            buffered_events,
-                            discarded_usage,
-                        )
-                        for stream_event in combined_events:
-                            if stream_event.usage is not None:
-                                request.usage = stream_event.usage
-                            yield stream_event
+                    for stream_event in self._add_discarded_stream_usage(final_events, discarded_usage):
+                        if stream_event.usage is not None:
+                            request.usage = stream_event.usage
+                        yield stream_event
                     return
             finally:
                 lease.release()

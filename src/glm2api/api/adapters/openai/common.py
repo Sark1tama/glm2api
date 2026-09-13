@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import mimetypes
+from dataclasses import replace
 
 from ....core.models import ToolChoice
 
@@ -24,7 +25,16 @@ def file_data_to_data_url(file_data: object, filename: object = None) -> str | N
     return f"data:{mime_type};base64,{data_url}"
 
 
-def tool_choice_from_openai(value: object) -> ToolChoice | None:
+def tool_choice_from_openai(value: object, parallel_tool_calls: object = True) -> ToolChoice | None:
+    if not isinstance(parallel_tool_calls, bool):
+        raise ValueError("parallel_tool_calls 必须是布尔值")
+    choice = _parse_tool_choice(value)
+    if not parallel_tool_calls:
+        return replace(choice or ToolChoice(mode="auto"), parallel_tool_calls=False)
+    return choice
+
+
+def _parse_tool_choice(value: object) -> ToolChoice | None:
     """Parse the shared tool-choice shapes accepted by OpenAI endpoints."""
     if value is None:
         return None

@@ -45,6 +45,7 @@ class ToolChoice:
 
     mode: str
     name: str | None = None
+    parallel_tool_calls: bool = True
 
     def __post_init__(self) -> None:
         if self.mode not in {"auto", "required", "none", "function"}:

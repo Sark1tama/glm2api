@@ -519,6 +519,7 @@ class GLM2APIServer:
                 response = internal_to_openai_responses_response(
                     result,
                     model,
+                    request=request,
                     max_output_tokens=request.max_tokens,
                     structured_output=request.structured_output,
                 )
@@ -530,6 +531,7 @@ class GLM2APIServer:
                 usage = request.usage
                 accumulator = OpenAIResponsesStreamAccumulator(
                     model=model,
+                    request=request,
                     usage=usage,
                     max_output_tokens=request.max_tokens,
                     structured_output=request.structured_output,
