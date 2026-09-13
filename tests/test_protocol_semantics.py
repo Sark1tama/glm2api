@@ -2,7 +2,11 @@ import json
 
 import pytest
 
-from glm2api.api.adapters.anthropic.messages import anthropic_messages_to_internal
+from glm2api.api.adapters.anthropic.messages import (
+    AnthropicMessagesStreamAccumulator,
+    anthropic_messages_to_internal,
+    internal_to_anthropic_messages_response,
+)
 from glm2api.api.adapters.openai.chat_completions import openai_chat_completions_to_internal
 from glm2api.api.adapters.openai.responses import (
     OpenAIResponsesStreamAccumulator,
@@ -19,6 +23,36 @@ def tool_block(names=("a",)):
         f'<|DSML|invoke name="{name}"><|DSML|parameter name="command">echo STOP</|DSML|parameter></|DSML|invoke>'
         for name in names
     ) + "</|DSML|tool_calls>"
+
+
+@pytest.mark.parametrize("convert,payload", [
+    (openai_responses_to_internal, {"input": "hello"}),
+    (anthropic_messages_to_internal, {"messages": [{"role": "user", "content": "hello"}]}),
+])
+def test_empty_tools_matches_omitted_tools(convert, payload):
+    assert convert({**payload, "tools": []}) == convert(payload)
+    for invalid in ({}, "", False):
+        with pytest.raises(ValueError, match="tools"):
+            convert({**payload, "tools": invalid})
+
+
+@pytest.mark.parametrize("source", [
+    {"type": "text", "data": "document text"},
+    {"type": "content", "content": [{"type": "text", "text": "document text"}]},
+    {"type": "url", "url": "https://example.test/report.pdf"},
+    {"type": "base64", "media_type": "application/pdf", "data": "AQI="},
+])
+def test_document_tool_result_preserves_content_and_call_id(source):
+    document = {"type": "document", "source": source, "title": "report"}
+    direct = anthropic_messages_to_internal({"messages": [{"role": "user", "content": [document]}]})
+    request = anthropic_messages_to_internal({"messages": [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "read", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": [document]}]},
+    ]})
+    result = request.messages[-1]
+    assert result.role == "tool"
+    assert result.tool_call_id == "call_1"
+    assert result.content == direct.messages[0].content
 
 
 def consume(accumulator, text):
@@ -148,3 +182,61 @@ def test_responses_reports_request_tool_metadata_in_both_modes():
         assert output["tool_choice"] == {"type": "function", "name": "a"}
         assert output["tools"][0]["name"] == "a"
         assert output["tools"][0]["parameters"] == {"type": "object"}
+
+
+@pytest.mark.parametrize("limit", [None, 10])
+def test_omitted_thinking_hides_text_preserving_usage_budget_and_signature(limit):
+    accumulator = GLMUpstreamEventAccumulator(model="test", max_output_tokens=limit)
+    events, _ = accumulator.consume_event({"parts": [{"logic_id": "one", "content": [
+        {"type": "think", "think": "Hidden reasoning."},
+        {"type": "text", "text": "Answer."},
+    ]}]})
+    events.extend(accumulator.finalize("finish"))
+    result = accumulator.build_response()
+    normal = internal_to_anthropic_messages_response(result, "test")
+    hidden = internal_to_anthropic_messages_response(result, "test", include_reasoning=False)
+    assert hidden["content"][0]["thinking"] == ""
+    assert hidden["content"][0]["signature"] == normal["content"][0]["signature"]
+    assert hidden["usage"] == normal["usage"]
+    assert hidden["usage"]["output_tokens"] > 0
+    assert hidden["stop_reason"] == ("max_tokens" if limit else "end_turn")
+    outputs = []
+    for include in (True, False):
+        adapter = AnthropicMessagesStreamAccumulator("test", include_reasoning=include)
+        chunks = [chunk for event in events for chunk in adapter.feed_event(event)]
+        outputs.append([json.loads(line[6:]) for chunk in chunks for line in chunk.splitlines() if line.startswith("data: ")])
+    visible_events, hidden_events = outputs
+    assert not any(p.get("delta", {}).get("type") == "thinking_delta" for p in hidden_events)
+    assert "Hidden reasoning." not in json.dumps(hidden_events)
+    for event_type in ("signature_delta",):
+        assert [p["delta"] for p in hidden_events if p.get("delta", {}).get("type") == event_type] == [
+            p["delta"] for p in visible_events if p.get("delta", {}).get("type") == event_type
+        ]
+    assert next(p for p in hidden_events if p["type"] == "message_delta") == next(
+        p for p in visible_events if p["type"] == "message_delta"
+    )
+    request = anthropic_messages_to_internal({"messages": [
+        {"role": "assistant", "content": hidden["content"]},
+        {"role": "user", "content": "continue"},
+    ]})
+    assert request.messages[0].content[0].text == ""
+    assert request.messages[0].content[0].metadata["signature"] == hidden["content"][0]["signature"]
+
+
+def test_omitted_without_reasoning_does_not_fabricate_thinking_block():
+    accumulator = GLMUpstreamEventAccumulator(model="test")
+    events = consume(accumulator, "Answer.")
+    events.extend(accumulator.finalize("finish"))
+    result = internal_to_anthropic_messages_response(accumulator.build_response(), "test", include_reasoning=False)
+    assert result["content"] == [{"type": "text", "text": "Answer."}]
+    adapter = AnthropicMessagesStreamAccumulator("test", include_reasoning=False)
+    chunks = "".join(chunk for event in events for chunk in adapter.feed_event(event))
+    assert '"type":"thinking"' not in chunks
+    assert "signature_delta" not in chunks
+
+
+@pytest.mark.parametrize("mode", ["enabled", "adaptive"])
+@pytest.mark.parametrize("display", [[], {}, "invalid"])
+def test_invalid_thinking_display_is_validation_error(mode, display):
+    with pytest.raises(ValueError, match="thinking.display"):
+        anthropic_messages_to_internal({"messages": [], "thinking": {"type": mode, "display": display}})

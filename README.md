@@ -149,7 +149,7 @@ curl http://127.0.0.1:8000/v1/videos/video_xxx/content -o result.mp4
 - `glm-image-1`：只用于 `/v1/images/generations`。
 - `glm-video-1`：只用于 `/v1/videos`。
 
-聊天图片和文件会先上传到 ChatGLM 网页端。Anthropic `document`、Responses `input_file.file_data/file_url` 可转换；外部 `file_id` 没有本地文件资源映射，会返回 400。
+聊天图片和文件会先上传到 ChatGLM 网页端。Anthropic 普通消息及 `tool_result.content` 中的 `document`、Responses `input_file.file_data/file_url` 可转换；外部 `file_id` 没有本地文件资源映射，会返回 400。
 
 Anthropic Messages 的 `messages[].role` 支持 `user`、`assistant` 和 `system`。中途 `system` 消息会按原始位置转换，当前支持字符串或 `text` blocks；Anthropic 工具结果应放在 `user` 消息的 `tool_result` block 中，而不是使用 `role: "tool"`。消息级 `clear_at`、`output_config` 以及 `tool_addition`/`tool_removal` 尚无等价的 GLM 映射，会明确返回 400。
 
@@ -157,7 +157,11 @@ ChatGLM 网页协议没有通用的 `temperature`、`top_p`、停止序列或结
 
 网页 SSE 当前不提供 token 统计，因此响应中的 `usage` 是基于原始请求和转换后 prompt 的保守估算，不代表计费精度；若上游将来返回统计值，则优先使用上游字段。
 
+Anthropic 的 `thinking.display="omitted"` 可与 `enabled` 或 `adaptive` 一起使用：保留推理过程、usage 与输出预算，只隐藏返回的推理文字。流式不发送 `thinking_delta`，有推理时仍返回空 thinking 块和兼容 signature。该签名无法恢复隐藏推理；多轮依靠调用方传回的正文和工具历史，不等价于 Anthropic 原厂的加密推理恢复，也不保证降低 GLM 生成延迟。
+
 ## 工具调用
+
+各文本接口均接受 `tools: []`，与不提供工具定义等价；显式要求调用工具时仍需提供可用工具。
 
 OpenAI 的 `parallel_tool_calls=false` 与 Anthropic 的 `tool_choice.disable_parallel_tool_use=true` 会限制每轮最多交付一个客户端工具调用：提示词要求串行调用，若模型仍生成多个调用，代理只返回第一个完整调用。停止序列仅匹配 DSML 解析后的正文，不匹配工具名称或参数。Responses 返回的工具定义、选择策略和并行设置来自本次内部请求。
 

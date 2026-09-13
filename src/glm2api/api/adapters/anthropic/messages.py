@@ -245,17 +245,19 @@ def _tool_result_content(content: object, path: str) -> str | tuple[ContentBlock
     if not isinstance(content, list):
         if content is None:
             return ""
-        raise ValueError(f"Anthropic {path}.content 必须是字符串或文本/图片 block 数组")
+        raise ValueError(f"Anthropic {path}.content 必须是字符串或文本/图片/文档 block 数组")
 
     parts: list[ContentBlock] = []
     for index, raw_block in enumerate(content):
         block_path = f"{path}.content[{index}]"
-        block = _validated_block(raw_block, block_path, frozenset({"text", "image"}))
+        block = _validated_block(raw_block, block_path, frozenset({"text", "image", "document"}))
         if block.get("type") == "text":
             text = block.get("text")
             if not isinstance(text, str):
                 raise ValueError(f"Anthropic {block_path}.text 必须是字符串")
             parts.append(ContentBlock(kind="text", text=text))
+        elif block.get("type") == "document":
+            parts.extend(_document_content_blocks(block, block_path))
         else:
             parts.append(_image_content_block(block, block_path))
     if len(parts) == 1 and parts[0].kind == "text":
@@ -495,7 +497,7 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
 
     # --- tools ---
     anthropic_tools = payload.get("tools")
-    if isinstance(anthropic_tools, list) and anthropic_tools:
+    if isinstance(anthropic_tools, list):
         for index, tool in enumerate(anthropic_tools):
             if not isinstance(tool, dict):
                 raise ValueError(f"Anthropic tools[{index}] 必须是对象")
@@ -564,22 +566,22 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
             output_effort = effort
 
     thinking = payload.get("thinking")
+    include_reasoning = True
     reasoning_effort: str | None = output_effort
     if thinking is not None:
         if not isinstance(thinking, dict):
             raise ValueError("Anthropic thinking 必须是对象")
         thinking_type = thinking.get("type")
+        display = thinking.get("display")
+        if display is not None and (not isinstance(display, str) or display not in {"summarized", "omitted"}):
+            raise ValueError("Anthropic thinking.display 必须是 summarized 或 omitted")
+        include_reasoning = display != "omitted"
         if thinking_type == "enabled":
             budget_tokens = thinking.get("budget_tokens", "medium")
             if isinstance(budget_tokens, bool) or not isinstance(budget_tokens, (int, str)):
                 raise ValueError("Anthropic thinking.budget_tokens 类型无效")
             reasoning_effort = output_effort or str(budget_tokens)
         elif thinking_type == "adaptive":
-            display = thinking.get("display")
-            if display == "omitted":
-                raise ValueError("Anthropic thinking.display=omitted 暂不支持")
-            if display not in {None, "summarized"}:
-                raise ValueError("Anthropic thinking.display 必须是 summarized 或 omitted")
             reasoning_effort = output_effort or "high"
         elif thinking_type == "disabled":
             reasoning_effort = None
@@ -623,6 +625,7 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
         tool_choice=normalized_tool_choice,
         structured_output=structured_output,
         reasoning_effort=reasoning_effort,
+        include_reasoning=include_reasoning,
         web_search=web_search,
     )
 
@@ -635,6 +638,8 @@ def anthropic_messages_to_internal(payload: dict[str, object]) -> TextGeneration
 def internal_to_anthropic_messages_response(
     result: TextGenerationResponse,
     model: str,
+    *,
+    include_reasoning: bool = True,
 ) -> dict[str, object]:
     """Convert an internal text result to Anthropic Messages format."""
     content: list[dict[str, object]] = []
@@ -650,7 +655,7 @@ def internal_to_anthropic_messages_response(
     if message.reasoning_content and not has_structured_thinking:
         content.append({
             "type": "thinking",
-            "thinking": message.reasoning_content,
+            "thinking": message.reasoning_content if include_reasoning else "",
             "signature": _compatibility_thinking_signature(message.reasoning_content),
         })
 
@@ -665,7 +670,7 @@ def internal_to_anthropic_messages_response(
                 signature = block.metadata.get("signature")
                 thinking_block = dict(block.metadata)
                 thinking_block["type"] = "thinking"
-                thinking_block["thinking"] = block.text or ""
+                thinking_block["thinking"] = (block.text or "") if include_reasoning else ""
                 thinking_block["signature"] = (
                     signature
                     if isinstance(signature, str) and signature
@@ -726,8 +731,11 @@ class AnthropicMessagesStreamAccumulator:
         self,
         model: str,
         usage: TokenUsage | None = None,
+        *,
+        include_reasoning: bool = True,
     ) -> None:
         self.model = model
+        self.include_reasoning = include_reasoning
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
         self.started = False
@@ -772,6 +780,8 @@ class AnthropicMessagesStreamAccumulator:
                 events.append(self._content_block_start("thinking", {"thinking": "", "signature": ""}))
                 self.current_block_type = "thinking"
             self._thinking_parts.append(event.reasoning_content)
+            if not self.include_reasoning:
+                return events
             events.append(self._sse("content_block_delta", {
                 "type": "content_block_delta",
                 "index": self.content_index,

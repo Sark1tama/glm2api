@@ -121,7 +121,8 @@ def test_uploaded_file_reference_requires_an_uploaded_id(result):
     assert _build_uploaded_reference(result, "https://source.example/file", is_image=False) is None
 
 
-def test_anthropic_document_reuses_chatglm_file_upload_path(monkeypatch):
+@pytest.mark.parametrize("in_tool_result", [False, True])
+def test_anthropic_document_reuses_chatglm_file_upload_path(monkeypatch, in_tool_result):
     request = anthropic_messages_to_internal(
         {
             "model": "glm-5.3-flash",
@@ -142,6 +143,18 @@ def test_anthropic_document_reuses_chatglm_file_upload_path(monkeypatch):
             ],
         }
     )
+    if in_tool_result:
+        request = anthropic_messages_to_internal({
+            "model": "glm-5.3-flash",
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "read", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": [
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AQI="}},
+                ]}]},
+            ],
+        })
+        assert request.messages[-1].role == "tool"
+        assert request.messages[-1].tool_call_id == "call_1"
     client = GLMWebClient.__new__(GLMWebClient)
     client.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
     file_service = FileService(client)

@@ -145,6 +145,7 @@ class TextGenerationRequest:
     tool_choice: ToolChoice | None = None
     structured_output: StructuredOutputConfig | None = None
     reasoning_effort: str | None = None
+    include_reasoning: bool = True
     web_search: bool = False
     extra: dict[str, object] = field(default_factory=dict)
     usage: TokenUsage | None = field(default=None, repr=False, compare=False)

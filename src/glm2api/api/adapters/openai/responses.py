@@ -361,7 +361,7 @@ def openai_responses_to_internal(payload: dict[str, object]) -> TextGenerationRe
     resp_tools = payload.get("tools")
     tools: list[ToolDefinition] = []
     web_search = False
-    if isinstance(resp_tools, list) and resp_tools:
+    if isinstance(resp_tools, list):
         for index, tool in enumerate(resp_tools):
             if not isinstance(tool, dict):
                 raise ValueError(f"Responses tools[{index}] 必须是对象")

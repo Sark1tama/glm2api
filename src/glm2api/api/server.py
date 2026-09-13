@@ -438,14 +438,18 @@ class GLM2APIServer:
                 result, _ = glm_client.chat_completion(request)
                 if not isinstance(result, TextGenerationResponse):
                     raise TypeError("GLM 客户端返回了非内部文本响应")
-                response = internal_to_anthropic_messages_response(result, model)
+                response = internal_to_anthropic_messages_response(
+                    result, model, include_reasoning=request.include_reasoning,
+                )
                 self._write_json(HTTPStatus.OK, response)
 
             def _stream_anthropic(self, request: TextGenerationRequest, model: str) -> None:
                 request.stream = True
                 stream_iter = glm_client.stream_chat_completion(request)
                 usage = request.usage
-                accumulator = AnthropicMessagesStreamAccumulator(model=model, usage=usage)
+                accumulator = AnthropicMessagesStreamAccumulator(
+                    model=model, usage=usage, include_reasoning=request.include_reasoning,
+                )
 
                 writer = start_sse_response(
                     self,

@@ -1271,15 +1271,17 @@ def test_anthropic_output_config_preserves_json_schema_format():
     )
 
 
-def test_anthropic_adaptive_thinking_rejects_omitted_display():
-    with pytest.raises(ValueError, match="display=omitted"):
-        anthropic_messages_to_internal(
-            {
-                "model": "glm-5.3-flash",
-                "messages": [{"role": "user", "content": "检查仓库"}],
-                "thinking": {"type": "adaptive", "display": "omitted"},
-            }
-        )
+@pytest.mark.parametrize("mode", ["adaptive", "enabled"])
+def test_anthropic_thinking_accepts_omitted_display(mode):
+    request = anthropic_messages_to_internal(
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "检查仓库"}],
+            "thinking": {"type": mode, "display": "omitted"},
+        }
+    )
+    assert request.include_reasoning is False
+    assert request.reasoning_effort is not None
 
 
 def test_anthropic_messages_to_internal_rejects_empty_redacted_thinking_data():
